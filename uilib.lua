@@ -14,8 +14,6 @@
         Glow = false,                 -- accent glow behind the window
         AnimatedBorder = false,       -- slowly rotating accent gradient border
         Rainbow = false,              -- slow hue-cycling accent
-        Splash = true,                -- startup splash with logo + progress bar
-        Sounds = true, SoundVolume = 0.4,
     })
 
     New element APIs:
@@ -24,6 +22,8 @@
       Tab:AddGauge({ Title = "Load", Default = 0.7, Suffix = "%" })  :Set(0..1)
       Tab:AddSkeleton({ Title = "Loading..." })            :Destroy()
       Tab:AddSection("Name") returns a section object with :Toggle() / :Set(open)
+      local cols = Tab:AddColumns(2)  -- side-by-side columns; add widgets per column:
+        cols[1]:AddToggle({ Title = "Left" })  cols[2]:AddSlider({ Title = "Right" })
     Widget cfg extras: Tooltip = "text", Badge = "NEW" (tabs + cards),
     Notify({ Type = "success" | "warning" | "error" | "info" }) + click-to-dismiss.
 ]]
@@ -35,7 +35,6 @@ local Prism = (function()
     local CoreGui          = game:GetService("CoreGui")
     local HttpService      = game:GetService("HttpService")
     local RunService       = game:GetService("RunService")
-    local SoundService     = game:GetService("SoundService")
 
     local Library = {}
     local Window, Tab = {}, {}
@@ -46,13 +45,6 @@ local Prism = (function()
         BuilderSans = { Normal = Enum.Font.BuilderSans,      Medium = Enum.Font.BuilderSansMedium,      Bold = Enum.Font.BuilderSansBold },
         Montserrat  = { Normal = Enum.Font.Montserrat,       Medium = Enum.Font.MontserratMedium,       Bold = Enum.Font.MontserratBold },
         Code        = { Normal = Enum.Font.Code,             Medium = Enum.Font.Code,                   Bold = Enum.Font.Code },
-    }
-
-    -- Roblox built-in sounds, overridable: Library.Sounds.Click = "rbxassetid://..."
-    Library.Sounds = {
-        Click    = "rbxasset://sounds/snap.mp3",
-        Toggle   = "rbxasset://sounds/button.wav",
-        Notify   = "rbxasset://sounds/electronicpingshort.wav",
     }
 
     local TI     = TweenInfo.new(0.18, Enum.EasingStyle.Quad,  Enum.EasingDirection.Out)
@@ -259,27 +251,6 @@ local Prism = (function()
     function Window:_ts(n) return math.floor((n or 13) * (self.TextScale or 1) + 0.5) end
     function Window:_font(weight) return (FONT_MAP[self._fontName] or FONT_MAP.Gotham)[weight or "Normal"] end
 
-    function Window:_sound(name)
-        if not self._sounds then return end
-        local id = Library.Sounds[name]
-        if not id then return end
-        task.spawn(function()
-            local ok, s = pcall(New, "Sound", { SoundId = id, Volume = self._soundVolume or 0.4 })
-            if not ok or not s then return end
-            pcall(function() SoundService:PlayLocalSound(s) end)
-            task.delay(3, function() s:Destroy() end)
-        end)
-    end
-
-    -- Attach optional sound to any pressable.
-    function Window:_pressable(inst, soundName)
-        inst.InputBegan:Connect(function(i)
-            if isPress(i) then
-                self:_sound(soundName or "Click")
-            end
-        end)
-    end
-
     -- Hover tooltip.
     function Window:_tooltip(inst, text)
         if not text or text == "" then return end
@@ -382,21 +353,29 @@ local Prism = (function()
         if not self._borderStroke then return end
         if on then
             if not self._borderGrad then
+                -- UIGradient multiplies the stroke colour, so force the stroke
+                -- to white and let the gradient supply the accent colours.
                 self._borderGrad = New("UIGradient", { Parent = self._borderStroke, Rotation = 0 })
                 self:_onTheme(self._borderStroke, function()
                     local a = self.Theme.Accent
                     self._borderGrad.Color = ColorSequence.new(a, shiftHue(a, -60))
+                    self._borderStroke.Color = Color3.new(1, 1, 1)
+                    self._borderStroke.Thickness = 1.6
                 end)
             end
             if not self._borderConn then
-                self._borderConn = RunService.Heartbeat:Connect(function()
-                    self._borderGrad.Rotation = (os.clock() * 50) % 360
+                self._borderConn = RunService.RenderStepped:Connect(function()
+                    if self._borderGrad and self._borderGrad.Parent then
+                        self._borderGrad.Rotation = (os.clock() * 60) % 360
+                    end
                 end)
                 table.insert(self._conns, self._borderConn)
             end
         else
             if self._borderConn then self._borderConn:Disconnect(); self._borderConn = nil end
             if self._borderGrad then self._borderGrad:Destroy(); self._borderGrad = nil end
+            self._borderStroke.Thickness = 1
+            self:_refresh() -- restores the bound Stroke colour
         end
     end
 
@@ -419,8 +398,6 @@ local Prism = (function()
         end
     end
 
-    function Window:SetSounds(on) self._sounds = on == true end
-    function Window:SetSoundVolume(v) self._soundVolume = math.clamp(tonumber(v) or 0.4, 0, 1) end
 
     function Window:SetCornerRadius(r)
         self.CornerRadius = math.clamp(r, 0, 28)
@@ -503,7 +480,6 @@ local Prism = (function()
     end
 
     function Window:SelectTab(tab)
-        self:_sound("Click")
         if self.ActiveTab == tab then
             tab.Page.Visible = true
             tab.Page.Position = UDim2.new(0, 0, 0, 0)
@@ -525,61 +501,104 @@ local Prism = (function()
     end
 
     local NOTIF_TYPES = {
-        info    = { glyph = "i", colorKey = "Accent" },
-        success = { glyph = "✓", color = rgb(52, 199, 89) },
-        warning = { glyph = "!", color = rgb(251, 176, 52) },
-        error   = { glyph = "✕", color = rgb(239, 68, 68) },
+        info    = { glyph = "i" },
+        success = { glyph = "✓", color = rgb(64, 200, 100) },
+        warning = { glyph = "!", color = rgb(250, 176, 60) },
+        error   = { glyph = "✕", color = rgb(240, 80, 80) },
     }
 
+    -- Fully rebuilt notifications: bottom-right toasts with a type icon,
+    -- title + message, close button and an edge progress line.
+    -- cfg: { Title, Content, Type = "info"|"success"|"warning"|"error", Duration }
+    -- or just a plain string for a quick info toast.
     function Window:Notify(cfg)
         if type(cfg) == "string" then cfg = { Content = cfg } end
         cfg = cfg or {}
-        self:_sound("Notify")
         self._notifId += 1
         local nType = NOTIF_TYPES[cfg.Type] or NOTIF_TYPES.info
+        local accent = nType.color or self.Theme.Accent
+        local duration = math.max(0.5, tonumber(cfg.Duration) or 4)
 
-        local wrap = New("Frame", { Parent = self._notifs, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = self._notifId })
-        local card = New("TextButton", { Parent = wrap, Position = UDim2.fromOffset(310, 0), Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BorderSizePixel = 0, Text = "", AutoButtonColor = false, ClipsDescendants = true })
+        -- layout slot in the stack
+        local wrap = New("Frame", {
+            Parent = self._notifs, BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            LayoutOrder = self._notifId,
+        })
+        local card = New("TextButton", {
+            Parent = wrap, Text = "", AutoButtonColor = false, BorderSizePixel = 0,
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1, Position = UDim2.fromOffset(0, -12),
+        })
         self:_bind(card, "BackgroundColor3", "Surface")
-        self:_glassify(card, 0.35)
-        self:_corner(card, 0.35)
-        pad(card, 10, 12)
-        New("UIListLayout", { Parent = card, Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder })
+        self:_glassify(card, 0.3)
+        self:_corner(card, 0.3)
+        local cardStroke = self:_stroke(card, "Stroke")
+        cardStroke.Transparency = 0.6
 
-        local title = self:_text(card, cfg.Title or "Notice", 13, self:_font("Bold"), "Text")
-        title.LayoutOrder = 1
-        pad(title, 0, 0, 0, 8)
-
-        -- type icon bubble
-        local bubble = New("Frame", { Parent = title, Position = UDim2.new(0, -8, 0, 1), Size = UDim2.fromOffset(14, 14), BorderSizePixel = 0 })
+        -- icon bubble
+        local bubble = New("Frame", {
+            Parent = card, AnchorPoint = Vector2.new(0, 0), Position = UDim2.new(0, 12, 0, 12),
+            Size = UDim2.fromOffset(26, 26), BorderSizePixel = 0,
+        })
         self:_corner(bubble, "pill")
-        if nType.color then bubble.BackgroundColor3 = nType.color
-        else self:_bind(bubble, "BackgroundColor3", "Accent") end
+        bubble.BackgroundColor3 = accent
+        if not nType.color then self:_bind(bubble, "BackgroundColor3", "Accent") end
         local glyph = New("TextLabel", {
             Parent = bubble, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
-            Text = nType.glyph, Font = self:_font("Bold"), TextSize = self:_ts(9),
-            TextColor3 = Color3.new(1, 1, 1), TextYAlignment = Enum.TextYAlignment.Center,
+            Text = nType.glyph, Font = self:_font("Bold"), TextSize = self:_ts(12),
+            TextColor3 = Color3.new(1, 1, 1), TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
         })
-        self:_styleLabel(glyph, "Bold", 9)
+        self:_styleLabel(glyph, "Bold", 12)
         if not nType.color then self:_bind(glyph, "TextColor3", "AccentText") end
 
+        -- text column
+        local texts = New("Frame", {
+            Parent = card, BackgroundTransparency = 1,
+            Position = UDim2.new(0, 48, 0, 10), Size = UDim2.new(1, -78, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y,
+        })
+        New("UIListLayout", { Parent = texts, Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder })
+        local title = self:_text(texts, cfg.Title or "Notice", 13, self:_font("Bold"), "Text")
+        title.LayoutOrder = 1
         if cfg.Content then
-            local content = self:_text(card, cfg.Content, 12, self:_font("Normal"), "SubText")
+            local content = self:_text(texts, cfg.Content, 12, self:_font("Normal"), "SubText")
             content.LayoutOrder = 2
         end
 
-        local duration = math.max(0.5, tonumber(cfg.Duration) or 4)
-        card.BackgroundTransparency = 1
-        tween(card, { Position = UDim2.fromOffset(0, 0), BackgroundTransparency = (self._glass or 0) * 0.35 }, TI_POP)
+        -- close button
+        local closeBtn = New("TextButton", {
+            Parent = card, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 8),
+            Size = UDim2.fromOffset(18, 18), BackgroundTransparency = 1, BorderSizePixel = 0,
+            Text = "×", Font = self:_font("Bold"), TextSize = self:_ts(15),
+            TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+        })
+        self:_styleLabel(closeBtn, "Bold", 15)
+        self:_bind(closeBtn, "TextColor3", "SubText")
+        closeBtn.MouseEnter:Connect(function() tween(closeBtn, { TextColor3 = self.Theme.Text }) end)
+        closeBtn.MouseLeave:Connect(function() tween(closeBtn, { TextColor3 = self.Theme.SubText }) end)
+
+        -- progress line along the bottom edge
+        local bar = New("Frame", {
+            Parent = card, AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0),
+            Size = UDim2.new(1, 0, 0, 2), BorderSizePixel = 0, BackgroundColor3 = accent,
+        })
+        if not nType.color then self:_bind(bar, "BackgroundColor3", "Accent") end
+
+        -- entrance: fade + rise
+        local restingT = (self._glass or 0) * 0.3
+        tween(card, { Position = UDim2.fromOffset(0, 0), BackgroundTransparency = restingT }, TI_POP)
+        tween(bar, { Size = UDim2.new(0, 0, 0, 2) }, TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out))
 
         local dismissed = false
         local function dismiss()
             if dismissed then return end
             dismissed = true
-            tween(card, { Position = UDim2.fromOffset(310, 0), BackgroundTransparency = 1 }, TI)
-            task.delay(0.2, function() if wrap.Parent then wrap:Destroy() end end)
+            tween(card, { BackgroundTransparency = 1, Position = UDim2.fromOffset(0, -8) }, TI)
+            task.delay(0.18, function() if wrap.Parent then wrap:Destroy() end end)
         end
-        card.MouseButton1Click:Connect(dismiss) -- click-to-dismiss
+        closeBtn.MouseButton1Click:Connect(dismiss)
+        card.MouseButton1Click:Connect(dismiss)
         task.delay(duration, dismiss)
     end
 
@@ -705,9 +724,6 @@ local Prism = (function()
         tab:AddToggle({ ConfigKey = "Accent blob", Title = "Accent blob", Description = "Soft accent glow fading in the page corner.", Default = self._blobOn == true, Callback = function(on) self:SetBlob(on) end })
         tab:AddToggle({ ConfigKey = "Window glow", Title = "Accent window glow", Default = self._glow == true, Callback = function(on) self:SetGlow(on) end })
         tab:AddToggle({ ConfigKey = "Animated border", Title = "Animated gradient border", Default = self._animBorder == true, Callback = function(on) self:SetAnimatedBorder(on) end })
-        tab:AddSection("Sound")
-        tab:AddToggle({ ConfigKey = "Sounds", Title = "Interface sounds", Default = self._sounds == true, Callback = function(on) self:SetSounds(on) end })
-        tab:AddSlider({ ConfigKey = "Sound volume", Title = "Sound volume", Min = 0, Max = 1, Increment = 0.05, Default = self._soundVolume, Callback = function(v) self:SetSoundVolume(v) end })
         tab:AddSection("Window")
         tab:AddKeybind({ ConfigKey = "Toggle key", Title = "Toggle key", Default = self.ToggleKey, Changed = function(k) self.ToggleKey = k end })
         tab:AddToggle({ ConfigKey = "Start minimized", Title = "Start minimized", Default = false, Callback = function(on) self:SetMinimized(on) end })
@@ -868,31 +884,25 @@ local Prism = (function()
         w:_styleLabel(chev, "Bold", 16)
         w:_bind(chev, "TextColor3", "SubText")
 
-        local body = New("CanvasGroup", { Parent = wrap, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2, GroupTransparency = 0 })
+        -- Plain Frame: CanvasGroup does not reliably support AutomaticSize,
+        -- which collapsed section content into an overlapping stack that
+        -- blocked clicks on widgets and section headers.
+        local body = New("Frame", { Parent = wrap, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2 })
         local bodyLayout = New("UIListLayout", { Parent = body, Padding = UDim.new(0, w._d.gap), SortOrder = Enum.SortOrder.LayoutOrder })
         table.insert(w._densityRegs, { fn = function(d) bodyLayout.Padding = UDim.new(0, d.gap) end })
 
         local sec = { open = true }
-        local token = 0
         function sec:Set(open)
-            token += 1
-            local my = token
             sec.open = open == true
             tween(chev, { Rotation = sec.open and 90 or 0 }, TI)
-            if sec.open then
-                body.Visible = true
-                tween(body, { GroupTransparency = 0 }, TI)
-            else
-                tween(body, { GroupTransparency = 1 }, TI)
-                task.delay(0.18, function()
-                    if my == token and not sec.open then body.Visible = false end
-                end)
-            end
+            body.Visible = sec.open
         end
         function sec:Toggle() sec:Set(not sec.open) end
         function sec:Get() return sec.open end
         function sec:SetTitle(text) label.Text = string.upper(tostring(text)) end
-        header.MouseButton1Click:Connect(function() w:_sound("Click"); sec:Toggle() end)
+        header.MouseButton1Click:Connect(function() sec:Toggle() end)
+        header.MouseEnter:Connect(function() tween(label, { TextColor3 = w.Theme.Text }, TI) end)
+        header.MouseLeave:Connect(function() tween(label, { TextColor3 = w.Theme.SubText }, TI) end)
 
         table.insert(self._sectionStack, sec)
         return sec
@@ -935,7 +945,6 @@ local Prism = (function()
     function Tab:AddButton(cfg)
         local card, header = self:_card(cfg, 20, "TextButton")
         self:_hover(card)
-        self.Window:_pressable(card)
         local chev = New("TextLabel", rightAnchored({ Parent = header, Size = UDim2.fromOffset(16, 20), BackgroundTransparency = 1, Text = "›", Font = self.Window:_font("Bold"), TextSize = self.Window:_ts(22) }))
         self.Window:_styleLabel(chev, "Bold", 22)
         self.Window:_bind(chev, "TextColor3", "Accent")
@@ -951,7 +960,6 @@ local Prism = (function()
         local w = self.Window
         local card, header = self:_card(cfg, 44, "TextButton")
         self:_hover(card)
-        w:_pressable(card, "Toggle")
         local track = New("Frame", rightAnchored({ Parent = header, Size = UDim2.fromOffset(40, 22) }))
         w:_corner(track, "pill")
         track.BackgroundColor3 = Color3.new(1, 1, 1) -- gradient supplies the colour
@@ -1123,7 +1131,7 @@ local Prism = (function()
                     end
                 end)
                 b.MouseLeave:Connect(function() paint() end)
-                b.MouseButton1Click:Connect(function() w:_sound("Click"); choose(val) end)
+                b.MouseButton1Click:Connect(function() choose(val) end)
             end
             if list.Visible then
                 tween(list, { Size = UDim2.new(1, 0, 0, math.min(#values * 32, 140)) }, TI)
@@ -1144,7 +1152,7 @@ local Prism = (function()
             end
             display(); repaint(); safe(cfg.Callback, obj:Get())
         end
-        box.MouseButton1Click:Connect(function() w:_sound("Click"); setOpen(not list.Visible) end)
+        box.MouseButton1Click:Connect(function() setOpen(not list.Visible) end)
         rebuild()
         return self:_registerState(cfg, obj)
     end
@@ -1390,7 +1398,6 @@ local Prism = (function()
             w:_bind(label, "TextColor3", "SubText")
             buttons[value] = { dot = dot, dotInner = dotInner, label = label }
             row.MouseButton1Click:Connect(function()
-                w:_sound("Click")
                 selected = value; repaint(); safe(cfg.Callback, value)
             end)
         end
@@ -1425,9 +1432,9 @@ local Prism = (function()
             box.Text = tostring(v)
             if not silent then safe(cfg.Callback, v) end
         end
-        minus.MouseButton1Click:Connect(function() w:_sound("Click"); apply(value - inc) end)
-        plus.MouseButton1Click:Connect(function() w:_sound("Click"); apply(value + inc) end)
         box.FocusLost:Connect(function() apply(tonumber(box.Text) or value) end)
+        minus.MouseButton1Click:Connect(function() apply(value - inc) end)
+        plus.MouseButton1Click:Connect(function() apply(value + inc) end)
         apply(value, true)
         return self:_registerState(cfg, { Get = function() return value end, Set = function(_, v) apply(v) end })
     end
@@ -1524,7 +1531,6 @@ local Prism = (function()
             w:_bind(label, "TextColor3", "SubText")
             rows[value] = { box = box, tick = tick, label = label }
             row.MouseButton1Click:Connect(function()
-                w:_sound("Toggle")
                 state[value] = not state[value] or nil
                 repaint()
                 local out = {}
@@ -2123,8 +2129,6 @@ local Prism = (function()
         self._glass       = math.clamp(tonumber(cfg.Glass) or 0, 0, 1)
         self._pattern     = cfg.Pattern or "none"
         self._glow        = cfg.Glow == true
-        self._sounds      = cfg.Sounds ~= false
-        self._soundVolume = math.clamp(tonumber(cfg.SoundVolume) or 0.4, 0, 1)
         self:_buildTheme()
         self:SetDensity(cfg.Density == "compact" and "compact" or "comfortable")
 
@@ -2137,13 +2141,7 @@ local Prism = (function()
         self.Holder, self._scale = holder, scale
         tween(scale, { Scale = 1 }, TI_POP)
 
-        -- soft drop shadow (and optional accent glow) behind the window
-        local shadow = New("ImageLabel", {
-            Parent = holder, BackgroundTransparency = 1, Image = SHADOW_IMAGE,
-            ImageColor3 = Color3.new(0, 0, 0), ImageTransparency = 0.45, ScaleType = Enum.ScaleType.Slice,
-            SliceCenter = SHADOW_SLICE, Size = UDim2.new(1, 70, 1, 70), Position = UDim2.fromScale(0.5, 0.5),
-            AnchorPoint = Vector2.new(0.5, 0.5), ZIndex = -2,
-        })
+        -- optional accent glow behind the window
         local glow = New("ImageLabel", {
             Parent = holder, BackgroundTransparency = 1, Image = SHADOW_IMAGE,
             ScaleType = Enum.ScaleType.Slice, SliceCenter = SHADOW_SLICE,
@@ -2394,7 +2392,7 @@ local Prism = (function()
         end)
         self:_connect(UserInputService.InputEnded, function(i) if isPress(i) then dragging = false end end)
 
-        minBtn.MouseButton1Click:Connect(function() self:_sound("Click"); self:SetMinimized(not self._minimized) end)
+        minBtn.MouseButton1Click:Connect(function() self:SetMinimized(not self._minimized) end)
         closeBtn.MouseButton1Click:Connect(function()
             tween(scale, { Scale = 0.9 }, TI)
             task.delay(0.15, function() self:Destroy() end)
@@ -2406,48 +2404,6 @@ local Prism = (function()
         -- optional animated gradient border (off by default)
         if cfg.AnimatedBorder then self:SetAnimatedBorder(true) end
         if cfg.Rainbow then self:SetRainbow(true) end
-
-        -- startup splash: logo + progress bar
-        if cfg.Splash then
-            local splash = New("CanvasGroup", { Parent = gui, Size = UDim2.fromScale(1, 1), ZIndex = 200, BorderSizePixel = 0 })
-            self:_bind(splash, "BackgroundColor3", "Background")
-            local logo = New("TextLabel", {
-                Parent = splash, BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
-                Position = UDim2.new(0.5, 0, 0.5, -24), Size = UDim2.fromOffset(400, 40),
-                Text = cfg.Title or "PrismUI", Font = self:_font("Bold"), TextSize = self:_ts(30),
-                TextXAlignment = Enum.TextXAlignment.Center,
-            })
-            self:_styleLabel(logo, "Bold", 30)
-            local logoGrad = New("UIGradient", { Parent = logo })
-            self:_onTheme(logo, function()
-                local a = self.Theme.Accent
-                logoGrad.Color = ColorSequence.new(a, shiftHue(a, 40))
-            end)
-            local splashSub = New("TextLabel", {
-                Parent = splash, BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
-                Position = UDim2.new(0.5, 0, 0.5, 8), Size = UDim2.fromOffset(400, 18),
-                Text = "loading...", Font = self:_font("Medium"), TextSize = self:_ts(12),
-                TextXAlignment = Enum.TextXAlignment.Center,
-            })
-            self:_styleLabel(splashSub, "Medium", 12)
-            self:_bind(splashSub, "TextColor3", "SubText")
-            local barBg = New("Frame", {
-                Parent = splash, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 36),
-                Size = UDim2.fromOffset(220, 6), BorderSizePixel = 0,
-            })
-            self:_corner(barBg, "pill")
-            self:_bind(barBg, "BackgroundColor3", "Elevated")
-            local barFill = New("Frame", { Parent = barBg, Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0 })
-            self:_corner(barFill, "pill")
-            self:_gradient(barFill, 25)
-            tween(barFill, { Size = UDim2.new(1, 0, 1, 0) }, TweenInfo.new(1.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out))
-            task.delay(1.25, function()
-                if splash.Parent then
-                    tween(splash, { GroupTransparency = 1 }, TI)
-                    task.delay(0.2, function() splash:Destroy() end)
-                end
-            end)
-        end
 
         local parent = cfg.Parent
         if not parent and typeof(gethui) == "function" then
@@ -2462,8 +2418,6 @@ local Prism = (function()
         end
         return self
     end
-        
-        
 
     return Library
 end)()
