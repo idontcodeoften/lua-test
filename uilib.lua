@@ -271,20 +271,20 @@ local Prism = (function()
         end)
     end
 
-    -- Click ripple inside a clipped container.
+    -- Click ripple. Drawn on a dedicated screen-level layer so it never
+    -- participates in any UIListLayout (inserting it into cards shifted
+    -- their content and broke the layout for a moment).
     function Window:_ripple(parent, x, y)
-        if parent.ClipsDescendants ~= true then return end
-        local abs = parent.AbsolutePosition
-        local size = math.max(parent.AbsoluteSize.X, parent.AbsoluteSize.Y) * 2.2
+        if not self._rippleLayer or not self._rippleLayer.Parent then return end
         local r = New("Frame", {
-            Parent = parent, AnchorPoint = Vector2.new(0.5, 0.5),
-            Position = UDim2.fromOffset(x - abs.X, y - abs.Y),
-            Size = UDim2.fromOffset(4, 4), BackgroundColor3 = Color3.new(1, 1, 1),
-            BackgroundTransparency = 0.65, BorderSizePixel = 0, ZIndex = 20,
+            Parent = self._rippleLayer, AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromOffset(x, y),
+            Size = UDim2.fromOffset(6, 6), BackgroundColor3 = Color3.new(1, 1, 1),
+            BackgroundTransparency = 0.72, BorderSizePixel = 0, ZIndex = 90,
         })
         self:_corner(r, "pill")
-        tween(r, { Size = UDim2.fromOffset(size, size), BackgroundTransparency = 1 }, TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out))
-        task.delay(0.5, function() r:Destroy() end)
+        tween(r, { Size = UDim2.fromOffset(90, 90), BackgroundTransparency = 1 }, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out))
+        task.delay(0.4, function() r:Destroy() end)
     end
 
     -- Attach ripple + optional sound to any pressable.
@@ -799,7 +799,7 @@ local Prism = (function()
     function Tab:_card(cfg, ctrlW, class, parent)
         local w = self.Window
         parent = parent or self:_host()
-        local card = New(class or "Frame", { Parent = parent, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BorderSizePixel = 0, LayoutOrder = self:_next(), ClipsDescendants = true })
+        local card = New(class or "Frame", { Parent = parent, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BorderSizePixel = 0, LayoutOrder = self:_next() })
         if class == "TextButton" then card.Text = ""; card.AutoButtonColor = false end
         w:_bind(card, "BackgroundColor3", "Surface")
         w:_glassify(card, 0.35)
@@ -2385,6 +2385,9 @@ local Prism = (function()
 
         self._notifs = New("Frame", { Parent = gui, BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -20, 1, -20), Size = UDim2.new(0, 280, 1, -40) })
         New("UIListLayout", { Parent = self._notifs, Padding = UDim.new(0, 8), VerticalAlignment = Enum.VerticalAlignment.Bottom, SortOrder = Enum.SortOrder.LayoutOrder })
+
+        -- screen-level layer for click ripples (kept out of all list layouts)
+        self._rippleLayer = New("Frame", { Parent = gui, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 90 })
 
         -- resize handle
         if cfg.Resizable then
