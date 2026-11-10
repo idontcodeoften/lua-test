@@ -1,5 +1,5 @@
 --[[
-    PrismUI v2.0 - executor single-file build (lean + minimal)
+    PrismUI v2.1 - executor single-file build (lean + minimal)
 
     local Prism  = loadstring(game:HttpGet("RAW_GITHUB_URL"))()
     local Window = Prism:CreateWindow({ Title = "My UI", Tags = { "BETA" } })
@@ -13,6 +13,16 @@
       * Widgets accept cfg.NoSave = true to be excluded from config profiles
       * Dropdown:Set(v, silent), Slider:Set(v, silent), Toggle:Set(v, silent)
       * Library:AddTheme(name, theme), Library:AddIcon(name, assetId)
+
+    New in 2.1 (animations + graphs):
+      * Tab:AddLineGraph  - multi-series, filled, hover tooltip, realtime mode (MaxPoints + :Push)
+      * Tab:AddBarGraph   - animated bars, hover highlight
+      * Tab:AddDistribution - segmented proportion bar with legend
+      * Graphs replay their intro animation whenever their tab is opened (Animate = false to disable)
+      * Sliding tab indicator, page fade, notification timer bar, slider knob grow
+      * progress:SetIndeterminate(true) / AddProgressBar({ Indeterminate = true })
+      * Window:SetAnimations(bool), Window:SetAnimationSpeed(0.25-4)  (global), also CreateWindow
+        options Animations / AnimationSpeed, and controls in AddAppearanceTab
 ]]
 
 local Prism = (function()
@@ -22,7 +32,7 @@ local Prism = (function()
     local CoreGui          = game:GetService("CoreGui")
     local HttpService      = game:GetService("HttpService")
 
-    local Library = { Version = "2.0" }
+    local Library = { Version = "2.1" }
     local Window, Tab = {}, {}
     Window.__index, Tab.__index = Window, Tab
 
@@ -93,8 +103,20 @@ local Prism = (function()
         return inst
     end
 
+    -- global animation settings (shared by every window): Window:SetAnimations / SetAnimationSpeed
+    local ANIM = { on = true, speed = 1 }
+    local function T(t) return ANIM.on and t / ANIM.speed or 0 end -- scale a delay to the current speed
+
     local function tween(inst, goal, info)
-        TweenService:Create(inst, info or TI, goal):Play()
+        if not ANIM.on then
+            for k, v in pairs(goal) do inst[k] = v end
+            return
+        end
+        info = info or TI
+        if ANIM.speed ~= 1 then
+            info = TweenInfo.new(info.Time / ANIM.speed, info.EasingStyle, info.EasingDirection, info.RepeatCount, info.Reverses, info.DelayTime)
+        end
+        TweenService:Create(inst, info, goal):Play()
     end
 
     local function apply(inst, goal, animate)
@@ -274,7 +296,7 @@ local Prism = (function()
             tween(self._scale, { Scale = 1 }, TI_POP)
         else
             tween(self._scale, { Scale = 0.95 }, TI)
-            task.delay(0.15, function()
+            task.delay(T(0.15), function()
                 if self._visToken == token and self.Holder.Parent then self.Holder.Visible = false end
             end)
         end
@@ -296,7 +318,7 @@ local Prism = (function()
         self._minIcon.Image = resolveIcon(state and "maximize-2" or "minimize-2")
         if state then
             tween(self.Holder, { Size = UDim2.fromOffset(math.min(self._size.X, 300), TOP_H) }, TI_POP)
-            task.delay(0.26, function()
+            task.delay(T(0.26), function()
                 if token == self._minToken and self._minimized then self._body.Visible = false end
             end)
         else
@@ -307,6 +329,11 @@ local Prism = (function()
 
     function Window:SetToggleKey(key) self.ToggleKey = key end
     function Window:GetToggleKey() return self.ToggleKey end
+
+    function Window:SetAnimations(on) ANIM.on = on ~= false end
+    function Window:SetAnimationSpeed(s) ANIM.speed = math.clamp(tonumber(s) or 1, 0.25, 4) end
+    function Window:GetAnimations() return ANIM.on, ANIM.speed end
+    function Window:Tween(inst, goal, info) tween(inst, goal, info or TI_POP) end
 
     function Window:SetWatermark(text)
         if self._watermark then self._watermark:Destroy(); self._watermark = nil end
@@ -328,15 +355,37 @@ local Prism = (function()
         self.Gui:Destroy()
     end
 
+    function Window:_moveIndicator(tab, animate)
+        local btn, ind, side = tab._btn, self._indicator, self._sidebar
+        local function go(anim)
+            if not btn.Parent or self.ActiveTab ~= tab then return end
+            local sc = self._scale.Scale
+            local goal = {
+                Position = UDim2.fromOffset(8, (btn.AbsolutePosition.Y - side.AbsolutePosition.Y) / sc),
+                Size = UDim2.new(1, -16, 0, btn.AbsoluteSize.Y / sc),
+            }
+            ind.Visible = true
+            if anim then tween(ind, goal, TI_POP) else for k, v in pairs(goal) do ind[k] = v end end
+        end
+        if btn.AbsoluteSize.Y > 0 then go(animate) else task.delay(0.05, function() go(false) end) end
+    end
+
     function Window:SelectTab(tab)
         local prev = self.ActiveTab
         if prev == tab then return end
         self.ActiveTab = tab
         if prev then prev.Page.Visible = false; prev._paint(true) end
-        tab.Page.Position = UDim2.fromOffset(8, 0)
+        tab.Page.Position = UDim2.fromOffset(10, 0)
         tab.Page.Visible = true
         tween(tab.Page, { Position = UDim2.fromOffset(0, 0) }, TI_POP)
+        local curtain = self._curtain
+        if ANIM.on then
+            curtain.BackgroundTransparency = 0.25
+            tween(curtain, { BackgroundTransparency = 1 }, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out))
+        end
         tab._paint(true)
+        self:_moveIndicator(tab, prev ~= nil)
+        for _, f in ipairs(tab._onShow) do safe(f) end
     end
 
     function Window:Notify(cfg)
@@ -360,11 +409,17 @@ local Prism = (function()
         if cfg.Content then
             self:_text(content, tostring(cfg.Content), 12, FONT, "SubText").LayoutOrder = 2
         end
+        local duration = math.max(0.5, tonumber(cfg.Duration) or 4)
+        local timer = New("Frame", { Parent = card, AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 2), BackgroundTransparency = 0.5 })
+        self:_bind(timer, "BackgroundColor3", "Accent")
+        if ANIM.on then
+            TweenService:Create(timer, TweenInfo.new(duration, Enum.EasingStyle.Linear), { Size = UDim2.new(0, 0, 0, 2) }):Play()
+        end
         tween(card, { Position = UDim2.fromOffset(0, 0) }, TI_POP)
-        task.delay(math.max(0.5, tonumber(cfg.Duration) or 4), function()
+        task.delay(duration, function()
             if card.Parent then
                 tween(card, { Position = UDim2.fromOffset(300, 0) }, TI)
-                task.wait(0.16)
+                task.wait(T(0.16))
             end
             if wrap.Parent then wrap:Destroy() end
         end)
@@ -373,7 +428,7 @@ local Prism = (function()
     function Window:AddTab(cfg)
         if type(cfg) == "string" then cfg = { Title = cfg } end
         cfg = cfg or {}
-        local tab = setmetatable({ Window = self, Title = cfg.Title or "Tab", _order = 0, _keys = {} }, Tab)
+        local tab = setmetatable({ Window = self, Title = cfg.Title or "Tab", _order = 0, _keys = {}, _onShow = {} }, Tab)
         tab._root = tab
 
         self._navOrder += 1
@@ -390,9 +445,11 @@ local Prism = (function()
             icon = New("ImageLabel", { Parent = btn, Image = iconImage, Size = UDim2.fromOffset(16, 16), AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 11, 0.5, 0) })
         end
 
+        tab._btn = btn
         tab._paint = function(animate)
             local active, th = self.ActiveTab == tab, self.Theme
-            apply(btn, { BackgroundColor3 = th.Elevated, BackgroundTransparency = active and 0 or 1 }, animate)
+            btn.BackgroundColor3 = th.Elevated -- the sliding indicator draws the active fill
+            btn.BackgroundTransparency = 1
             apply(label, { TextColor3 = active and th.Text or th.SubText }, animate)
             if icon then apply(icon, { ImageColor3 = active and th.Accent or th.SubText }, animate) end
         end
@@ -445,6 +502,9 @@ local Prism = (function()
         tab:AddColorPicker({ Title = "Custom accent", Default = self.Theme.Accent, Callback = function(c) self:SetAccent(c) end })
         tab:AddSection("Shape")
         tab:AddSlider({ Title = "Corner radius", Description = "0 = sharp, 28 = very round", Min = 0, Max = 28, Default = self.CornerRadius, Suffix = "px", Callback = function(v) self:SetCornerRadius(v) end })
+        tab:AddSection("Animations")
+        tab:AddToggle({ Title = "Animations", Default = ANIM.on, Callback = function(v) self:SetAnimations(v) end })
+        tab:AddSlider({ Title = "Animation speed", Min = 0.5, Max = 2, Increment = 0.1, Default = ANIM.speed, Suffix = "x", Callback = function(v) self:SetAnimationSpeed(v) end })
         tab:AddSection("Window")
         tab:AddKeybind({ Title = "Toggle key", Default = self.ToggleKey, Changed = function(k) self.ToggleKey = k end })
         tab:AddToggle({ Title = "Start minimized", Default = false, Callback = function(on) self:SetMinimized(on) end })
@@ -660,7 +720,8 @@ local Prism = (function()
         hit.InputBegan:Connect(function(i)
             if isPress(i) then
                 fromX(i.Position.X)
-                beginDrag(function(p) fromX(p.X) end)
+                tween(knob, { Size = UDim2.fromOffset(16, 16) }, TI)
+                beginDrag(function(p) fromX(p.X) end, function() tween(knob, { Size = UDim2.fromOffset(12, 12) }, TI) end)
             end
         end)
 
@@ -744,7 +805,7 @@ local Prism = (function()
                 tween(listFrame, { Size = UDim2.new(1, 0, 0, targetHeight()) })
             else
                 tween(listFrame, { Size = UDim2.new(1, 0, 0, 0) })
-                task.delay(0.16, function() if t == token and listFrame.Parent then listFrame.Visible = false end end)
+                task.delay(T(0.16), function() if t == token and listFrame.Parent then listFrame.Visible = false end end)
             end
         end
 
@@ -935,20 +996,35 @@ local Prism = (function()
         local val = cfg.Default or 0
         local pct = New("TextLabel", rightAnchored({ Parent = header, Size = UDim2.fromOffset(60, 20), TextXAlignment = RIGHT }))
         w:_bind(pct, "TextColor3", "Accent")
-        local bar = New("Frame", { Parent = card, Size = UDim2.new(1, 0, 0, 6), LayoutOrder = 2 })
+        local bar = New("Frame", { Parent = card, Size = UDim2.new(1, 0, 0, 6), LayoutOrder = 2, ClipsDescendants = true })
         w:_corner(bar, "pill"); w:_bind(bar, "BackgroundColor3", "Stroke")
         local fill = New("Frame", { Parent = bar, Size = UDim2.fromScale(0, 1) })
         w:_corner(fill, "pill"); w:_bind(fill, "BackgroundColor3", "Accent")
+        local loop
         local function setVal(x, animate)
             val = math.clamp(x, 0, 1)
             apply(fill, { Size = UDim2.fromScale(val, 1) }, animate)
             pct.Text = string.format("%d%%", math.floor(val * 100 + 0.5))
         end
+        local obj = {}
+        function obj:Set(x) if not loop then setVal(x, true) else val = math.clamp(x, 0, 1) end end
+        function obj:Get() return val end
+        function obj:SetIndeterminate(on)
+            if loop then loop:Cancel(); loop = nil end
+            if on then
+                fill.Size = UDim2.fromScale(0.35, 1)
+                fill.Position = UDim2.fromScale(-0.35, 0)
+                pct.Text = ""
+                loop = TweenService:Create(fill, TweenInfo.new(1.1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1), { Position = UDim2.fromScale(1, 0) })
+                loop:Play()
+            else
+                fill.Position = UDim2.fromScale(0, 0)
+                setVal(val, false)
+            end
+        end
         setVal(val, false)
-        return self:_registerState(cfg, {
-            Set = function(_, x) setVal(x, true) end,
-            Get = function() return val end,
-        })
+        if cfg.Indeterminate then obj:SetIndeterminate(true) end
+        return self:_registerState(cfg, obj)
     end
 
     function Tab:AddRadioGroup(cfg)
@@ -1132,6 +1208,530 @@ local Prism = (function()
         }
     end
 
+    ------------------------------------------------------------------ graphs
+    local PALETTE = { rgb(56,189,248), rgb(52,211,153), rgb(251,176,52), rgb(251,86,140), rgb(186,104,255), rgb(255,122,74) }
+
+    local function pickColor(w, i, c)
+        if c then return c end
+        if i == 1 then return w.Theme.Accent end
+        return PALETTE[(i - 2) % #PALETTE + 1]
+    end
+
+    local function shortNumber(v)
+        local a = math.abs(v)
+        if a >= 1e9 then return string.format("%.1fB", v / 1e9) end
+        if a >= 1e6 then return string.format("%.1fM", v / 1e6) end
+        if a >= 1e4 then return string.format("%.1fK", v / 1e3) end
+        if v == math.floor(v) or a >= 100 then return string.format("%d", math.floor(v + 0.5)) end
+        return string.format("%.1f", v)
+    end
+
+    local function fmtValue(cfg, v)
+        if cfg.Format then return tostring(cfg.Format(v)) end
+        return formatNumber(v) .. (cfg.Suffix or "")
+    end
+
+    local function esc(s) -- RichText escape
+        s = tostring(s):gsub("&", "&amp;")
+        s = s:gsub("<", "&lt;")
+        return (s:gsub(">", "&gt;"))
+    end
+
+    --[[
+        AddLineGraph({
+            Title, Description, Height = 140,
+            Values = {..}                      -- one series, or
+            Series = { { Name, Color, Values } },
+            Labels = {..}                      -- optional x labels (tooltip)
+            MaxPoints = 60                     -- realtime mode: newest point enters from the right
+            Min, Max                           -- fixed y range (otherwise auto)
+            Fill = true | false | "all", Dots = true, Thickness = 2,
+            Suffix, Format = function(v), AxisFormat = function(v),
+            ShowLatest = true, Legend = true, Animate = true,
+        })
+        graph:SetData(valuesOrSeries)  graph:Push(value, seriesIndex)  graph:Clear()  graph:Replay()
+    ]]
+    function Tab:AddLineGraph(cfg)
+        local w, root = self.Window, self._root
+        local H, GUTTER, INSET = cfg.Height or 140, 36, 3
+        local realtime = cfg.MaxPoints ~= nil
+        local maxPts = cfg.MaxPoints or 120
+        local thick = cfg.Thickness or 2
+        local axisFmt = cfg.AxisFormat or shortNumber
+        local showLatest = cfg.ShowLatest ~= false
+
+        local card, header = self:_card(cfg, showLatest and 84 or 0)
+        local latest
+        if showLatest then
+            latest = New("TextLabel", rightAnchored({ Parent = header, Size = UDim2.fromOffset(84, 20), TextXAlignment = RIGHT }))
+            w:_bind(latest, "TextColor3", "Accent")
+        end
+
+        local area = New("Frame", { Parent = card, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, H), LayoutOrder = 2 })
+        local axisLabels = {}
+        for k, ys in ipairs({ 0, 0.5, 1 }) do
+            local l = New("TextLabel", {
+                Parent = area, AnchorPoint = Vector2.new(0, 0.5), TextSize = 10, TextXAlignment = RIGHT,
+                Position = UDim2.new(0, 0, ys, ys == 0 and 4 or (ys == 1 and -4 or 0)), Size = UDim2.fromOffset(GUTTER - 6, 12),
+            })
+            w:_bind(l, "TextColor3", "SubText")
+            axisLabels[k] = l
+        end
+
+        local plot = New("Frame", { Parent = area, BackgroundTransparency = 1, Position = UDim2.fromOffset(GUTTER, 4), Size = UDim2.new(1, -GUTTER, 1, -8) })
+        for _, ys in ipairs({ 0, 0.5, 1 }) do
+            local g = New("Frame", { Parent = plot, AnchorPoint = Vector2.new(0, ys), Position = UDim2.fromScale(0, ys), Size = UDim2.new(1, 0, 0, 1), BackgroundTransparency = 0.5 })
+            w:_bind(g, "BackgroundColor3", "Stroke")
+        end
+        local clip = New("Frame", { Parent = plot, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ClipsDescendants = true })
+
+        -- hover widgets
+        local hoverLine = New("Frame", { Parent = plot, Visible = false, AnchorPoint = Vector2.new(0.5, 0), Size = UDim2.new(0, 1, 1, 0), BackgroundTransparency = 0.5, ZIndex = 5 })
+        w:_bind(hoverLine, "BackgroundColor3", "SubText")
+        local tip = New("Frame", { Parent = plot, Visible = false, AutomaticSize = Enum.AutomaticSize.XY, Size = UDim2.fromOffset(0, 0), ZIndex = 10 })
+        w:_bind(tip, "BackgroundColor3", "Elevated")
+        w:_corner(tip, 0.4)
+        w:_stroke(tip, "Stroke")
+        pad(tip, 5, 8)
+        local tipText = New("TextLabel", { Parent = tip, AutomaticSize = Enum.AutomaticSize.XY, Size = UDim2.fromOffset(0, 0), RichText = true, TextSize = 11, TextXAlignment = LEFT })
+        w:_bind(tipText, "TextColor3", "Text")
+        local hoverDots = {}
+
+        local legend = New("Frame", { Parent = card, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AUTO_Y, LayoutOrder = 3, Visible = false })
+        layout(legend, 12, true).Wraps = true
+
+        local series, pools, legendItems = {}, {}, {}
+        local layoutInfo = { W = 0, step = 1, maxN = 0, pts = {} }
+        local dirty, scheduled, hoverX = false, false, nil
+
+        local function normalize(d)
+            local out = {}
+            if type(d) == "table" and type(d[1]) == "table" then
+                for i, s in ipairs(d) do
+                    out[i] = { Name = s.Name or ("Series " .. i), Color = s.Color, Values = table.clone(s.Values or {}) }
+                end
+            else
+                out[1] = { Name = cfg.SeriesName or cfg.Title or "Value", Color = cfg.Color, Values = type(d) == "table" and table.clone(d) or {} }
+            end
+            return out
+        end
+
+        local function updateLatest()
+            if not latest then return end
+            local s = series[1]
+            local v = s and s.Values[#s.Values]
+            latest.Text = v ~= nil and fmtValue(cfg, v) or "-"
+        end
+
+        local function rebuildLegend()
+            for _, l in ipairs(legendItems) do l:Destroy() end
+            legendItems = {}
+            legend.Visible = #series > 1 and cfg.Legend ~= false
+            for i, s in ipairs(series) do
+                local l = New("TextLabel", {
+                    Parent = legend, AutomaticSize = AUTO_X, Size = UDim2.fromOffset(0, 14), RichText = true, TextSize = 11, LayoutOrder = i,
+                    Text = string.format('<font color="%s">●</font> %s', color3ToHex(pickColor(w, i, s.Color)), esc(s.Name)),
+                })
+                w:_bind(l, "TextColor3", "SubText")
+                legendItems[i] = l
+            end
+        end
+
+        local function hideHover()
+            hoverX = nil
+            hoverLine.Visible, tip.Visible = false, false
+            for _, d in ipairs(hoverDots) do d.Visible = false end
+        end
+
+        local function showHover(screenX)
+            if layoutInfo.maxN == 0 then hideHover(); return end
+            hoverX = screenX
+            local sc = w._scale.Scale
+            local x = (screenX - plot.AbsolutePosition.X) / sc
+            local W, step = layoutInfo.W, layoutInfo.step
+            local lines, lineX, used = {}, nil, 0
+            for si, s in ipairs(series) do
+                local n = #s.Values
+                local pts = layoutInfo.pts[si]
+                if n > 0 and pts then
+                    local idx
+                    if realtime then idx = n - math.floor(((W - INSET) - x) / step + 0.5)
+                    else idx = math.floor((x - INSET) / step + 0.5) + 1 end
+                    idx = math.clamp(idx, 1, n)
+                    local p = pts[idx]
+                    if p then
+                        used += 1
+                        lineX = lineX or p.X
+                        local color = pickColor(w, si, s.Color)
+                        local dot = hoverDots[used]
+                        if not dot then
+                            dot = New("Frame", { Parent = plot, AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(9, 9), ZIndex = 6 })
+                            New("UICorner", { Parent = dot, CornerRadius = UDim.new(1, 0) })
+                            w:_stroke(dot, "Surface", 2)
+                            hoverDots[used] = dot
+                        end
+                        dot.Visible = true
+                        dot.BackgroundColor3 = color
+                        dot.Position = UDim2.fromOffset(p.X, p.Y)
+                        local head = (#lines == 0 and cfg.Labels and cfg.Labels[idx]) and (esc(cfg.Labels[idx]) .. "\n") or ""
+                        if #series == 1 then
+                            lines[#lines + 1] = head .. "<b>" .. esc(fmtValue(cfg, s.Values[idx])) .. "</b>"
+                        else
+                            lines[#lines + 1] = head .. string.format('<font color="%s">●</font> %s  <b>%s</b>', color3ToHex(color), esc(s.Name), esc(fmtValue(cfg, s.Values[idx])))
+                        end
+                    end
+                end
+            end
+            for i = used + 1, #hoverDots do hoverDots[i].Visible = false end
+            if not lineX then hideHover(); return end
+            hoverLine.Visible = true
+            hoverLine.Position = UDim2.fromOffset(lineX, 0)
+            local right = lineX > W / 2
+            tip.AnchorPoint = Vector2.new(right and 1 or 0, 0)
+            tip.Position = UDim2.fromOffset(lineX + (right and -10 or 10), 4)
+            tipText.Text = table.concat(lines, "\n")
+            tip.Visible = true
+        end
+
+        local function render()
+            scheduled = false
+            if w._destroyed then return end
+            if w.ActiveTab ~= root then dirty = true; return end
+            local sc = w._scale.Scale
+            local W, Hp = plot.AbsoluteSize.X / sc, plot.AbsoluteSize.Y / sc
+            if W < 12 or Hp < 12 then dirty = true; return end
+            dirty = false
+
+            local lo, hi = cfg.Min, cfg.Max
+            if lo == nil or hi == nil then
+                local mn, mx = math.huge, -math.huge
+                for _, s in ipairs(series) do
+                    for _, x in ipairs(s.Values) do
+                        if x < mn then mn = x end
+                        if x > mx then mx = x end
+                    end
+                end
+                if mn == math.huge then mn, mx = 0, 1 end
+                if mx == mn then mx = mn + 1 end
+                local p = (mx - mn) * 0.08
+                if lo == nil then lo = (mn >= 0 and mn - p < 0) and 0 or mn - p end
+                if hi == nil then hi = mx + p end
+            end
+            if hi <= lo then hi = lo + 1 end
+            local range = hi - lo
+            axisLabels[1].Text, axisLabels[2].Text, axisLabels[3].Text = axisFmt(hi), axisFmt(lo + range / 2), axisFmt(lo)
+
+            local maxN = 0
+            for _, s in ipairs(series) do if #s.Values > maxN then maxN = #s.Values end end
+            local span = math.max(realtime and maxPts or maxN, 2)
+            local step = (W - INSET * 2) / (span - 1)
+            layoutInfo.W, layoutInfo.step, layoutInfo.maxN = W, step, maxN
+            local yRange = Hp - INSET * 2
+
+            for si, s in ipairs(series) do
+                local pool = pools[si]
+                if not pool then pool = { segs = {}, dots = {}, fills = {} }; pools[si] = pool end
+                local color = pickColor(w, si, s.Color)
+                local vals, n = s.Values, #s.Values
+                local pts = {}
+                for i = 1, n do
+                    local x = realtime and (W - INSET - (n - i) * step) or (INSET + (i - 1) * step)
+                    local y = INSET + (1 - (vals[i] - lo) / range) * yRange
+                    pts[i] = Vector2.new(x, math.clamp(y, 0, Hp))
+                end
+                layoutInfo.pts[si] = pts
+
+                local showDots = cfg.Dots ~= false and n <= (cfg.DotsMax or 24)
+                local doFill = cfg.Fill ~= false and (si == 1 or cfg.Fill == "all")
+                for i = 1, n - 1 do
+                    local a, b = pts[i], pts[i + 1]
+                    local d = b - a
+                    local seg = pool.segs[i]
+                    if not seg then
+                        seg = New("Frame", { Parent = clip, AnchorPoint = Vector2.new(0.5, 0.5), ZIndex = 3 })
+                        pool.segs[i] = seg
+                    end
+                    seg.Visible = true
+                    seg.BackgroundColor3 = color
+                    seg.Position = UDim2.fromOffset((a.X + b.X) / 2, (a.Y + b.Y) / 2)
+                    seg.Size = UDim2.fromOffset(d.Magnitude + 1.2, thick)
+                    seg.Rotation = math.deg(math.atan2(d.Y, d.X))
+                    if doFill then
+                        local f = pool.fills[i]
+                        if not f then
+                            f = New("Frame", { Parent = clip, BackgroundTransparency = 0.88, ZIndex = 1 })
+                            pool.fills[i] = f
+                        end
+                        local top = (a.Y + b.Y) / 2
+                        f.Visible = true
+                        f.BackgroundColor3 = color
+                        f.Position = UDim2.fromOffset(a.X, top)
+                        f.Size = UDim2.fromOffset(d.X + 1, math.max(Hp - top, 0))
+                    end
+                end
+                for i = math.max(n, 1), #pool.segs do pool.segs[i].Visible = false end
+                for i = doFill and math.max(n, 1) or 1, #pool.fills do pool.fills[i].Visible = false end
+                if showDots then
+                    for i = 1, n do
+                        local dt = pool.dots[i]
+                        if not dt then
+                            dt = New("Frame", { Parent = clip, AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(6, 6), ZIndex = 4 })
+                            New("UICorner", { Parent = dt, CornerRadius = UDim.new(1, 0) })
+                            pool.dots[i] = dt
+                        end
+                        dt.Visible = true
+                        dt.BackgroundColor3 = color
+                        dt.Position = UDim2.fromOffset(pts[i].X, pts[i].Y)
+                    end
+                end
+                for i = showDots and n + 1 or 1, #pool.dots do pool.dots[i].Visible = false end
+            end
+            for si = #series + 1, #pools do -- series that were removed
+                local pool = pools[si]
+                for _, list in pairs(pool) do for _, f in ipairs(list) do f.Visible = false end end
+                layoutInfo.pts[si] = nil
+            end
+            if hoverX then showHover(hoverX) end
+        end
+
+        local function schedule()
+            if scheduled then return end
+            scheduled = true
+            task.defer(render)
+        end
+
+        local function reveal()
+            if cfg.Animate == false then return end
+            clip.Size = UDim2.new(0, 0, 1, 0)
+            tween(clip, { Size = UDim2.fromScale(1, 1) }, TweenInfo.new(0.7, Enum.EasingStyle.Quint, Enum.EasingDirection.Out))
+        end
+
+        plot.InputChanged:Connect(function(i) if isMove(i) then showHover(i.Position.X) end end)
+        plot.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.Touch then showHover(i.Position.X) end end)
+        plot.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.Touch then hideHover() end end)
+        plot.MouseLeave:Connect(hideHover)
+        plot:GetPropertyChangedSignal("AbsoluteSize"):Connect(schedule)
+        table.insert(root._onShow, function()
+            if dirty then render() end
+            reveal()
+        end)
+
+        local obj = {}
+        function obj:SetData(d, noReveal)
+            series = normalize(d)
+            rebuildLegend(); updateLatest(); schedule()
+            if not noReveal then reveal() end
+        end
+        function obj:Push(v, si)
+            local s = series[si or 1]
+            if not s then return end
+            s.Values[#s.Values + 1] = v
+            if #s.Values > maxPts then table.remove(s.Values, 1) end
+            updateLatest(); schedule()
+        end
+        function obj:Clear()
+            for _, s in ipairs(series) do s.Values = {} end
+            updateLatest(); schedule()
+        end
+        function obj:Get() return series end
+        function obj:Replay() reveal() end
+
+        series = normalize(cfg.Series or cfg.Values or cfg.Data)
+        w:_onTheme(plot, function() rebuildLegend(); schedule() end)
+        updateLatest()
+        reveal()
+        return obj
+    end
+
+    --[[
+        AddBarGraph({
+            Title, Description, Height = 140, Gap = 6,
+            Data = { { Label = "Mon", Value = 3, Color = Color3? }, ... }   -- or Values = {..}, Labels = {..}
+            Max (otherwise auto), ShowValues = true, Suffix, Format, Animate = true,
+        })
+        graph:SetData(data)  graph:SetValue(index, value)  graph:Replay()
+    ]]
+    function Tab:AddBarGraph(cfg)
+        local w, root = self.Window, self._root
+        local H, GAP, BAR_W = cfg.Height or 140, cfg.Gap or 6, 0.7
+        local card = self:_card(cfg, 0)
+        local area = New("Frame", { Parent = card, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, H + 18), LayoutOrder = 2 })
+        layout(area, GAP, true)
+        local items, cols = {}, {}
+
+        local function normalize(d)
+            local out = {}
+            if type(d) ~= "table" then return out end
+            if d.Values then
+                for i, v in ipairs(d.Values) do out[i] = { Label = d.Labels and d.Labels[i] or tostring(i), Value = v } end
+            elseif type(d[1]) == "table" then
+                for i, it in ipairs(d) do out[i] = { Label = it.Label or it.Name or tostring(i), Value = it.Value or 0, Color = it.Color } end
+            else
+                for i, v in ipairs(d) do out[i] = { Label = tostring(i), Value = v } end
+            end
+            return out
+        end
+
+        local function build()
+            for _, c in ipairs(cols) do c.col:Destroy() end
+            cols = {}
+            local n = #items
+            for i = 1, n do
+                local col = New("TextButton", { Parent = area, BackgroundTransparency = 1, Size = UDim2.new(1 / n, -(GAP * (n - 1) / n), 1, 0), LayoutOrder = i })
+                local plotA = New("Frame", { Parent = col, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, -18) })
+                local bar = New("Frame", { Parent = plotA, AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, 1), Size = UDim2.fromScale(BAR_W, 0), BackgroundTransparency = 0.1 })
+                w:_corner(bar, 0.3)
+                w:_onTheme(bar, function()
+                    local it = items[i]
+                    bar.BackgroundColor3 = (it and it.Color) or w.Theme.Accent
+                end)
+                local val = New("TextLabel", { Parent = bar, AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 0, -3), Size = UDim2.fromOffset(0, 12), AutomaticSize = AUTO_X, TextSize = 10, Visible = cfg.ShowValues ~= false })
+                w:_bind(val, "TextColor3", "Text")
+                local lbl = New("TextLabel", { Parent = col, Position = UDim2.new(0, 0, 1, -14), Size = UDim2.new(1, 0, 0, 14), TextSize = 10, TextTruncate = Enum.TextTruncate.AtEnd })
+                w:_bind(lbl, "TextColor3", "SubText")
+                col.MouseEnter:Connect(function() tween(bar, { BackgroundTransparency = 0 }); val.Visible = true end)
+                col.MouseLeave:Connect(function() tween(bar, { BackgroundTransparency = 0.1 }); val.Visible = cfg.ShowValues ~= false end)
+                cols[i] = { col = col, bar = bar, val = val, lbl = lbl, h = 0 }
+            end
+        end
+
+        local function update(animate)
+            local mx = cfg.Max
+            if not mx then
+                mx = 0
+                for _, it in ipairs(items) do if it.Value > mx then mx = it.Value end end
+                mx = mx * 1.15
+            end
+            if mx <= 0 then mx = 1 end
+            for i, it in ipairs(items) do
+                local c = cols[i]
+                c.h = math.clamp(it.Value / mx, 0, 1)
+                c.val.Text = fmtValue(cfg, it.Value)
+                c.lbl.Text = tostring(it.Label)
+                local goal = { Size = UDim2.fromScale(BAR_W, c.h) }
+                if animate then tween(c.bar, goal, TI_POP) else c.bar.Size = goal.Size end
+            end
+        end
+
+        local function replay()
+            if cfg.Animate == false or not ANIM.on then return end
+            for i, c in ipairs(cols) do
+                c.bar.Size = UDim2.fromScale(BAR_W, 0)
+                task.delay(T(i * 0.035), function()
+                    if c.bar.Parent then tween(c.bar, { Size = UDim2.fromScale(BAR_W, c.h) }, TI_POP) end
+                end)
+            end
+        end
+        table.insert(root._onShow, replay)
+
+        local obj = {}
+        function obj:SetData(d)
+            local old = #items
+            items = normalize(d)
+            if #items ~= old then build() end
+            update(true)
+        end
+        function obj:SetValue(i, v)
+            if items[i] then items[i].Value = v; update(true) end
+        end
+        function obj:Get() return items end
+        function obj:Replay() replay() end
+
+        items = normalize(cfg.Data or { Values = cfg.Values, Labels = cfg.Labels })
+        build()
+        update(false)
+        replay()
+        return obj
+    end
+
+    --[[
+        AddDistribution({ Title, Description, Data = { { Label, Value, Color }, ... }, ShowValue = false, BarHeight = 10 })
+        A segmented proportion bar with a legend (the minimal alternative to a pie chart).
+        dist:SetData(data)
+    ]]
+    function Tab:AddDistribution(cfg)
+        local w, root = self.Window, self._root
+        local GAP = 2
+        local card = self:_card(cfg, 0)
+        local row = New("Frame", { Parent = card, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, cfg.BarHeight or 10), LayoutOrder = 2 })
+        layout(row, GAP, true)
+        local legend = New("Frame", { Parent = card, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AUTO_Y, LayoutOrder = 3 })
+        layout(legend, 12, true).Wraps = true
+        local items, segs, labels = {}, {}, {}
+
+        local function normalize(d)
+            local out = {}
+            for i, it in ipairs(type(d) == "table" and d or {}) do
+                out[i] = { Label = it.Label or it.Name or tostring(i), Value = tonumber(it.Value) or 0, Color = it.Color }
+            end
+            return out
+        end
+
+        local function total()
+            local t = 0
+            for _, it in ipairs(items) do t += math.max(it.Value, 0) end
+            return t
+        end
+
+        local function paint()
+            local t = total()
+            for i, it in ipairs(items) do
+                local color = pickColor(w, i, it.Color)
+                segs[i].BackgroundColor3 = color
+                local pct = t > 0 and math.floor(it.Value / t * 100 + 0.5) or 0
+                local tail = cfg.ShowValue and string.format("%s · %d%%", formatNumber(it.Value), pct) or string.format("%d%%", pct)
+                labels[i].Text = string.format('<font color="%s">●</font>  %s  <font color="%s">%s</font>',
+                    color3ToHex(color), esc(it.Label), color3ToHex(w.Theme.SubText), tail)
+            end
+        end
+
+        local function build()
+            for _, s in ipairs(segs) do s:Destroy() end
+            for _, l in ipairs(labels) do l:Destroy() end
+            segs, labels = {}, {}
+            for i = 1, #items do
+                local seg = New("Frame", { Parent = row, Size = UDim2.fromScale(0, 1), LayoutOrder = i })
+                w:_corner(seg, "pill")
+                segs[i] = seg
+                local l = New("TextLabel", { Parent = legend, AutomaticSize = AUTO_X, Size = UDim2.fromOffset(0, 14), RichText = true, TextSize = 11, LayoutOrder = i })
+                w:_bind(l, "TextColor3", "Text")
+                labels[i] = l
+            end
+        end
+
+        local function update(animate)
+            local t, n = total(), #items
+            for i, it in ipairs(items) do
+                local f = t > 0 and math.max(it.Value, 0) / t or 0
+                local goal = { Size = UDim2.new(f, -GAP * (n - 1) * f, 1, 0) }
+                if animate then tween(segs[i], goal, TI_POP) else segs[i].Size = goal.Size end
+            end
+            paint()
+        end
+
+        local function replay()
+            if cfg.Animate == false or not ANIM.on then return end
+            for _, s in ipairs(segs) do s.Size = UDim2.fromScale(0, 1) end
+            update(true)
+        end
+        table.insert(root._onShow, replay)
+
+        local obj = {}
+        function obj:SetData(d)
+            items = normalize(d)
+            build(); update(true)
+        end
+        function obj:Get() return items end
+        function obj:Replay() replay() end
+
+        items = normalize(cfg.Data)
+        build()
+        update(false)
+        w:_onTheme(row, paint)
+        replay()
+        return obj
+    end
+
     ------------------------------------------------------------------ config profiles
     function Tab:AddConfigSection()
         local w = self.Window
@@ -1310,6 +1910,8 @@ local Prism = (function()
             themeData = type(self._themeName) == "table" and encodeValue(self._themeName) or nil,
             accent = self._accent and encodeValue(self._accent) or nil,
             corner = self.CornerRadius,
+            animations = ANIM.on,
+            animSpeed = ANIM.speed,
             size = { X = self._size.X, Y = self._size.Y },
             widgets = widgets,
         }
@@ -1336,6 +1938,8 @@ local Prism = (function()
         if s.themeData then self:SetTheme(decodeValue(s.themeData)) elseif s.theme and s.theme ~= "custom" then self:SetTheme(s.theme) end
         self:SetAccent(s.accent and decodeValue(s.accent) or nil)
         if type(s.corner) == "number" then self:SetCornerRadius(s.corner) end
+        if type(s.animations) == "boolean" then self:SetAnimations(s.animations) end
+        if type(s.animSpeed) == "number" then self:SetAnimationSpeed(s.animSpeed) end
         if type(s.size) == "table" and type(s.size.X) == "number" and type(s.size.Y) == "number" then
             self:SetSize(Vector2.new(s.size.X, s.size.Y))
         end
@@ -1357,6 +1961,8 @@ local Prism = (function()
         self.ToggleKey    = cfg.ToggleKey or Enum.KeyCode.RightShift
         self._size        = cfg.Size or Vector2.new(600, 400)
         self:_buildTheme()
+        if cfg.Animations ~= nil then ANIM.on = cfg.Animations ~= false end
+        if cfg.AnimationSpeed then ANIM.speed = math.clamp(tonumber(cfg.AnimationSpeed) or 1, 0.25, 4) end
 
         local size = self._size
         local gui = New("ScreenGui", { Name = "PrismUI", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 100, IgnoreGuiInset = true })
@@ -1432,15 +2038,24 @@ local Prism = (function()
         local body = New("Frame", { Parent = main, BackgroundTransparency = 1, Position = UDim2.fromOffset(0, TOP_H + 1), Size = UDim2.new(1, 0, 1, -(TOP_H + 1)) })
         self._body = body
 
-        local tabList = New("ScrollingFrame", { Parent = body, Size = UDim2.new(0, SIDEBAR_W, 1, 0), ScrollBarThickness = 0 })
+        local sidebar = New("Frame", { Parent = body, BackgroundTransparency = 1, Size = UDim2.new(0, SIDEBAR_W, 1, 0), ClipsDescendants = true })
+        local indicator = New("Frame", { Parent = sidebar, Visible = false, Position = UDim2.fromOffset(8, 8), Size = UDim2.new(1, -16, 0, 30) })
+        self:_corner(indicator, 0.5)
+        self:_bind(indicator, "BackgroundColor3", "Elevated")
+        local tabList = New("ScrollingFrame", { Parent = sidebar, Size = UDim2.fromScale(1, 1), ScrollBarThickness = 0 })
         pad(tabList, 8, 8, 8, 8)
         layout(tabList, 2)
-        self._tabList = tabList
+        self._tabList, self._sidebar, self._indicator = tabList, sidebar, indicator
+        tabList:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+            if self.ActiveTab then self:_moveIndicator(self.ActiveTab, false) end
+        end)
 
         local divider = New("Frame", { Parent = body, Position = UDim2.fromOffset(SIDEBAR_W, 0), Size = UDim2.new(0, 1, 1, 0) })
         self:_bind(divider, "BackgroundColor3", "Stroke")
 
         self._pages = New("Frame", { Parent = body, BackgroundTransparency = 1, Position = UDim2.fromOffset(SIDEBAR_W + 1, 0), Size = UDim2.new(1, -(SIDEBAR_W + 1), 1, 0), ClipsDescendants = true })
+        self._curtain = New("Frame", { Parent = self._pages, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 20 })
+        self:_bind(self._curtain, "BackgroundColor3", "Background")
 
         self._notifs = New("Frame", { Parent = gui, BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -20, 1, -20), Size = UDim2.new(0, 280, 1, -40) })
         layout(self._notifs, 8).VerticalAlignment = Enum.VerticalAlignment.Bottom
@@ -1476,7 +2091,7 @@ local Prism = (function()
         minBtn.MouseButton1Click:Connect(function() self:SetMinimized() end)
         closeBtn.MouseButton1Click:Connect(function()
             tween(scale, { Scale = 0.92 }, TI)
-            task.delay(0.12, function() safe(cfg.OnClose); self:Destroy() end)
+            task.delay(T(0.12), function() safe(cfg.OnClose); self:Destroy() end)
         end)
 
         -- one shared InputBegan for the toggle key + every keybind widget
