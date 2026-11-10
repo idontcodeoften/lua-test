@@ -271,28 +271,11 @@ local Prism = (function()
         end)
     end
 
-    -- Click ripple. Drawn on a dedicated screen-level layer so it never
-    -- participates in any UIListLayout (inserting it into cards shifted
-    -- their content and broke the layout for a moment).
-    function Window:_ripple(parent, x, y)
-        if not self._rippleLayer or not self._rippleLayer.Parent then return end
-        local r = New("Frame", {
-            Parent = self._rippleLayer, AnchorPoint = Vector2.new(0.5, 0.5),
-            Position = UDim2.fromOffset(x, y),
-            Size = UDim2.fromOffset(6, 6), BackgroundColor3 = Color3.new(1, 1, 1),
-            BackgroundTransparency = 0.72, BorderSizePixel = 0, ZIndex = 90,
-        })
-        self:_corner(r, "pill")
-        tween(r, { Size = UDim2.fromOffset(90, 90), BackgroundTransparency = 1 }, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out))
-        task.delay(0.4, function() r:Destroy() end)
-    end
-
-    -- Attach ripple + optional sound to any pressable.
+    -- Attach optional sound to any pressable.
     function Window:_pressable(inst, soundName)
         inst.InputBegan:Connect(function(i)
             if isPress(i) then
                 self:_sound(soundName or "Click")
-                self:_ripple(inst, i.Position.X, i.Position.Y)
             end
         end)
     end
@@ -846,7 +829,6 @@ local Prism = (function()
         card.InputBegan:Connect(function(input)
             if isPress(input) then
                 tween(card, { BackgroundColor3 = w.Theme.Elevated }, TweenInfo.new(0.07))
-                w:_ripple(card, input.Position.X, input.Position.Y)
             end
         end)
         card.InputEnded:Connect(function(input)
@@ -2385,9 +2367,6 @@ local Prism = (function()
 
         self._notifs = New("Frame", { Parent = gui, BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -20, 1, -20), Size = UDim2.new(0, 280, 1, -40) })
         New("UIListLayout", { Parent = self._notifs, Padding = UDim.new(0, 8), VerticalAlignment = Enum.VerticalAlignment.Bottom, SortOrder = Enum.SortOrder.LayoutOrder })
-
-        -- screen-level layer for click ripples (kept out of all list layouts)
-        self._rippleLayer = New("Frame", { Parent = gui, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 90 })
 
         -- resize handle
         if cfg.Resizable then
