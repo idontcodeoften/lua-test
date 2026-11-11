@@ -2559,7 +2559,7 @@ local Prism = (function()
         end)
         self:_connect(UserInputService.InputChanged, function(i)
             if dragging and isMove(i) then
-                local d = i.Position - dragStart
+                local d = Vector2.new(i.Position.X - dragStart.X, i.Position.Y - dragStart.Y)
                 holder.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
             end
         end)
