@@ -25,7 +25,11 @@
       local cols = Tab:AddColumns(2)  -- side-by-side columns; add widgets per column:
         cols[1]:AddToggle({ Title = "Left" })  cols[2]:AddSlider({ Title = "Right" })
     Widget cfg extras: Tooltip = "text", Badge = "NEW" (tabs + cards),
-    Notify({ Type = "success" | "warning" | "error" | "info" }) + click-to-dismiss.
+    Notify({ Title, Content, Type = "info"|"success"|"warning"|"error", Duration,
+             Color = Color3, Icon = "✓" or "rbxassetid://..." }).
+    Window:SetNotificationPosition("bottomright"|"bottomleft"|"topright"|"topleft"),
+    or cfg.NotificationPosition at creation. The window is draggable from any
+    non-interactive part of it (buttons, sliders and text boxes still work).
 ]]
 
 local Prism = (function()
@@ -348,6 +352,23 @@ local Prism = (function()
         if self._glowImage then self._glowImage.Visible = self._glow end
     end
 
+    local NOTIF_POSITIONS = {
+        bottomright = { anchor = Vector2.new(1, 1), pos = UDim2.new(1, -20, 1, -20), align = Enum.VerticalAlignment.Bottom },
+        bottomleft  = { anchor = Vector2.new(0, 1), pos = UDim2.new(0, 20, 1, -20),  align = Enum.VerticalAlignment.Bottom },
+        topright    = { anchor = Vector2.new(1, 0), pos = UDim2.new(1, -20, 0, 20),  align = Enum.VerticalAlignment.Top },
+        topleft     = { anchor = Vector2.new(0, 0), pos = UDim2.new(0, 20, 0, 20),   align = Enum.VerticalAlignment.Top },
+    }
+
+    function Window:SetNotificationPosition(pos)
+        local p = NOTIF_POSITIONS[pos] or NOTIF_POSITIONS.bottomright
+        self._notifPos = NOTIF_POSITIONS[pos] and pos or "bottomright"
+        if self._notifs then
+            self._notifs.AnchorPoint = p.anchor
+            self._notifs.Position = p.pos
+            self._notifLayout.VerticalAlignment = p.align
+        end
+    end
+
     function Window:SetAnimatedBorder(on)
         self._animBorder = on == true
         if not self._borderStroke then return end
@@ -516,7 +537,11 @@ local Prism = (function()
         cfg = cfg or {}
         self._notifId += 1
         local nType = NOTIF_TYPES[cfg.Type] or NOTIF_TYPES.info
-        local accent = nType.color or self.Theme.Accent
+        -- customization: cfg.Color overrides the type colour, cfg.Icon overrides
+        -- the glyph (text) or supplies "rbxassetid://..." for a custom image.
+        local accent = cfg.Color or nType.color or self.Theme.Accent
+        local iconText = cfg.Icon or nType.glyph
+        local iconAsset = type(iconText) == "string" and iconText:match("^rbxassetid://") or nil
         local duration = math.max(0.5, tonumber(cfg.Duration) or 4)
 
         -- layout slot in the stack
@@ -536,21 +561,27 @@ local Prism = (function()
         local cardStroke = self:_stroke(card, "Stroke")
         cardStroke.Transparency = 0.6
 
-        -- icon bubble
+        -- icon bubble with a soft accent gradient
         local bubble = New("Frame", {
             Parent = card, AnchorPoint = Vector2.new(0, 0), Position = UDim2.new(0, 12, 0, 12),
-            Size = UDim2.fromOffset(26, 26), BorderSizePixel = 0,
+            Size = UDim2.fromOffset(26, 26), BorderSizePixel = 0, BackgroundColor3 = Color3.new(1, 1, 1),
         })
         self:_corner(bubble, "pill")
-        bubble.BackgroundColor3 = accent
-        if not nType.color then self:_bind(bubble, "BackgroundColor3", "Accent") end
-        local glyph = New("TextLabel", {
-            Parent = bubble, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
-            Text = nType.glyph, Font = self:_font("Bold"), TextSize = self:_ts(12),
-            TextColor3 = Color3.new(1, 1, 1), TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
-        })
-        self:_styleLabel(glyph, "Bold", 12)
-        if not nType.color then self:_bind(glyph, "TextColor3", "AccentText") end
+        self:_gradient(bubble, 25, 135, accent, shiftHue(accent, 25))
+        if iconAsset then
+            New("ImageLabel", {
+                Parent = bubble, BackgroundTransparency = 1, Image = iconAsset,
+                Size = UDim2.fromOffset(14, 14), AnchorPoint = Vector2.new(0.5, 0.5),
+                Position = UDim2.fromScale(0.5, 0.5), ImageColor3 = Color3.new(1, 1, 1),
+            })
+        else
+            local glyph = New("TextLabel", {
+                Parent = bubble, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
+                Text = tostring(iconText), Font = self:_font("Bold"), TextSize = self:_ts(12),
+                TextColor3 = Color3.new(1, 1, 1), TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+            })
+            self:_styleLabel(glyph, "Bold", 12)
+        end
 
         -- text column
         local texts = New("Frame", {
@@ -585,9 +616,11 @@ local Prism = (function()
         })
         if not nType.color then self:_bind(bar, "BackgroundColor3", "Accent") end
 
-        -- entrance: fade + rise
+        -- entrance: fade + rise + subtle scale pop
         local restingT = (self._glass or 0) * 0.3
+        local pop = New("UIScale", { Parent = card, Scale = 0.96 })
         tween(card, { Position = UDim2.fromOffset(0, 0), BackgroundTransparency = restingT }, TI_POP)
+        tween(pop, { Scale = 1 }, TI_POP)
         tween(bar, { Size = UDim2.new(0, 0, 0, 2) }, TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out))
 
         local dismissed = false
@@ -724,6 +757,8 @@ local Prism = (function()
         tab:AddToggle({ ConfigKey = "Accent blob", Title = "Accent blob", Description = "Soft accent glow fading in the page corner.", Default = self._blobOn == true, Callback = function(on) self:SetBlob(on) end })
         tab:AddToggle({ ConfigKey = "Window glow", Title = "Accent window glow", Default = self._glow == true, Callback = function(on) self:SetGlow(on) end })
         tab:AddToggle({ ConfigKey = "Animated border", Title = "Animated gradient border", Default = self._animBorder == true, Callback = function(on) self:SetAnimatedBorder(on) end })
+        tab:AddSection("Notifications")
+        tab:AddDropdown({ ConfigKey = "Notification position", Title = "Notification position", Values = { "Bottom right", "Bottom left", "Top right", "Top left" }, Default = "Bottom right", Callback = function(v) self:SetNotificationPosition(string.lower(v):gsub(" ", "")) end })
         tab:AddSection("Window")
         tab:AddKeybind({ ConfigKey = "Toggle key", Title = "Toggle key", Default = self.ToggleKey, Changed = function(k) self.ToggleKey = k end })
         tab:AddToggle({ ConfigKey = "Start minimized", Title = "Start minimized", Default = false, Callback = function(on) self:SetMinimized(on) end })
@@ -2364,7 +2399,8 @@ local Prism = (function()
         self._blob, self._blobOn = blob, cfg.Blob == true
 
         self._notifs = New("Frame", { Parent = gui, BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -20, 1, -20), Size = UDim2.new(0, 280, 1, -40) })
-        New("UIListLayout", { Parent = self._notifs, Padding = UDim.new(0, 8), VerticalAlignment = Enum.VerticalAlignment.Bottom, SortOrder = Enum.SortOrder.LayoutOrder })
+        self._notifLayout = New("UIListLayout", { Parent = self._notifs, Padding = UDim.new(0, 8), VerticalAlignment = Enum.VerticalAlignment.Bottom, SortOrder = Enum.SortOrder.LayoutOrder })
+        self._notifPos = "bottomright"
 
         -- resize handle
         if cfg.Resizable then
@@ -2382,8 +2418,26 @@ local Prism = (function()
             self:_connect(UserInputService.InputEnded, function(i) if isPress(i) then resize = false end end)
         end
 
+        -- drag from anywhere on the window (except interactive controls).
+        -- Hit-tests what is actually under the cursor: if the press lands on a
+        -- button or text box the drag is skipped so widgets keep working.
         local dragging, dragStart, startPos = false, nil, nil
-        top.InputBegan:Connect(function(i) if isPress(i) then dragging, dragStart, startPos = true, i.Position, holder.Position end end)
+        local function overInteractive(x, y)
+            local ok, objs = pcall(function() return gui:GetGuiObjectsAtPosition(x, y) end)
+            if not ok or type(objs) ~= "table" then return false end
+            for _, o in ipairs(objs) do
+                if o:IsA("TextBox") or o:IsA("TextButton") then return true end
+            end
+            return false
+        end
+        self:_connect(UserInputService.InputBegan, function(i)
+            if not isPress(i) or self._minimized then return end
+            local m = UserInputService:GetMouseLocation()
+            local ap, as = holder.AbsolutePosition, holder.AbsoluteSize
+            if m.X < ap.X or m.X > ap.X + as.X or m.Y < ap.Y or m.Y > ap.Y + as.Y then return end
+            if overInteractive(m.X, m.Y) then return end
+            dragging, dragStart, startPos = true, Vector2.new(i.Position.X, i.Position.Y), holder.Position
+        end)
         self:_connect(UserInputService.InputChanged, function(i)
             if dragging and isMove(i) then
                 local d = i.Position - dragStart
@@ -2404,6 +2458,7 @@ local Prism = (function()
         -- optional animated gradient border (off by default)
         if cfg.AnimatedBorder then self:SetAnimatedBorder(true) end
         if cfg.Rainbow then self:SetRainbow(true) end
+        if cfg.NotificationPosition then self:SetNotificationPosition(cfg.NotificationPosition) end
 
         local parent = cfg.Parent
         if not parent and typeof(gethui) == "function" then
