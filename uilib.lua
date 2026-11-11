@@ -25,8 +25,11 @@
       local cols = Tab:AddColumns(2)  -- side-by-side columns; add widgets per column:
         cols[1]:AddToggle({ Title = "Left" })  cols[2]:AddSlider({ Title = "Right" })
     Widget cfg extras: Tooltip = "text", Badge = "NEW" (tabs + cards),
-    Notify({ Title, Content, Type = "info"|"success"|"warning"|"error", Duration,
-             Color = Color3, Icon = "✓" or "rbxassetid://..." }).
+    Notify({ Title, Message (or Content), Type = "info"|"success"|"warning"|"error",
+             Duration (0 = stays until dismissed), Color = Color3,
+             Icon = "!" or "rbxassetid://..." }) returns { Dismiss }.
+    Toasts stack with smooth reflow, pause on hover / touch-hold, dismiss by
+    swipe right on touch or the close button, and adapt their width on mobile.
     Window:SetNotificationPosition("bottomright"|"bottomleft"|"topright"|"topleft"),
     or cfg.NotificationPosition at creation. The window is draggable from any
     non-interactive part of it (buttons, sliders and text boxes still work).
@@ -164,32 +167,6 @@ local Prism = (function()
     local function shiftHue(c, deg)
         local h, s, v = Color3.toHSV(c)
         return Color3.fromHSV((h + deg / 360) % 1, s, v)
-    end
-
-    -- Drawn checkmark for success toasts (no icon asset needed).
-    local function drawCheck(parent, color, cx, cy)
-        for _, s in ipairs({
-            { x = cx - 3, y = cy + 1, len = 6,  rot = -45 },
-            { x = cx + 1, y = cy - 1, len = 11, rot = 45 },
-        }) do
-            local bar = New("Frame", {
-                Parent = parent, AnchorPoint = Vector2.new(0.5, 0.5),
-                Position = UDim2.fromOffset(s.x, s.y),
-                Size = UDim2.fromOffset(2, s.len),
-                Rotation = s.rot, BackgroundColor3 = color, BorderSizePixel = 0,
-            })
-            New("UICorner", { Parent = bar, CornerRadius = UDim.new(1, 0) })
-        end
-    end
-
-    -- Measure wrapped text height, with a fallback if TextService is unavailable.
-    local function measureTextHeight(text, size, width)
-        local ok, s = pcall(function()
-            return TextService:GetTextSize(text, size, Enum.Font.Gotham, Vector2.new(width, 1000))
-        end)
-        if ok and s and s.Y > 0 then return s.Y end
-        local lines = math.max(1, math.ceil(#text / math.max(1, math.floor(width / (size * 0.55)))))
-        return lines * (size + 4)
     end
 
     ------------------------------------------------------------------ window internals
@@ -386,16 +363,6 @@ local Prism = (function()
         topleft     = { anchor = Vector2.new(0, 0), pos = UDim2.new(0, 20, 0, 20),   align = Enum.VerticalAlignment.Top },
     }
 
-    function Window:SetNotificationPosition(pos)
-        local p = NOTIF_POSITIONS[pos] or NOTIF_POSITIONS.bottomright
-        self._notifPos = NOTIF_POSITIONS[pos] and pos or "bottomright"
-        if self._notifs then
-            self._notifs.AnchorPoint = p.anchor
-            self._notifs.Position = p.pos
-            self._notifLayout.VerticalAlignment = p.align
-        end
-    end
-
     function Window:SetAnimatedBorder(on)
         self._animBorder = on == true
         if not self._borderStroke then return end
@@ -548,118 +515,243 @@ local Prism = (function()
         end
     end
 
+    -- Toast notifications: manual stack with smooth reflow, hover/hold to
+    -- pause, swipe right to dismiss, sticky toasts (Duration = 0), responsive
+    -- width for mobile, and big tap targets. Themed from the active theme.
     local NOTIF_TYPES = {
-        info    = { glyph = "i" },
-        success = { glyph = "✓", color = rgb(64, 200, 100) },
-        warning = { glyph = "!", color = rgb(250, 176, 60) },
-        error   = { glyph = "✕", color = rgb(240, 80, 80) },
+        info    = { color = rgb(56, 132, 255), glyph = "i" },
+        success = { color = rgb(34, 170, 96),  glyph = "check" },
+        warning = { color = rgb(232, 160, 32), glyph = "!" },
+        error   = { color = rgb(232, 72, 66),  glyph = "×" },
     }
 
-    -- Fully rebuilt notifications: bottom-right toasts with a type icon,
-    -- title + message, close button and an edge progress line.
-    -- cfg: { Title, Content, Type = "info"|"success"|"warning"|"error", Duration }
-    -- or just a plain string for a quick info toast.
+    local function drawCheck(parent, color)
+        for _, s in ipairs({
+            { x = 10, y = 15, len = 5,  rot = -45 },
+            { x = 15, y = 13, len = 11, rot = 45  },
+        }) do
+            local bar = New("Frame", {
+                Parent = parent, AnchorPoint = Vector2.new(0.5, 0.5),
+                Position = UDim2.fromOffset(s.x, s.y), Size = UDim2.fromOffset(2, s.len),
+                Rotation = s.rot, BackgroundColor3 = color, BorderSizePixel = 0,
+            })
+            New("UICorner", { CornerRadius = UDim.new(0, 1), Parent = bar })
+        end
+    end
+
+    function Window:_notifReflow()
+        if not self._activeNotifs then return end
+        local dir = (self._notifPos == "bottomright" or self._notifPos == "bottomleft") and -1 or 1
+        local y = 0
+        for _, n in ipairs(self._activeNotifs) do
+            if n.card.Parent then
+                tween(n.card, { Position = UDim2.fromOffset(0, dir * y) },
+                    TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out))
+            end
+            y += n.height + 10
+        end
+    end
+
+    function Window:_dismissNotif(n)
+        if n.dismissed then return end
+        n.dismissed = true
+        for i, v in ipairs(self._activeNotifs) do
+            if v == n then table.remove(self._activeNotifs, i) break end
+        end
+        self:_notifReflow()
+        if n.barTween then n.barTween:Cancel() end
+        local out = TweenService:Create(n.card,
+            TweenInfo.new(0.28, Enum.EasingStyle.Quint, Enum.EasingDirection.In),
+            { Position = UDim2.fromOffset((self._notifWidth or 340) + 60, n.card.Position.Y.Offset), GroupTransparency = 1 })
+        out:Play()
+        out.Completed:Once(function() n.card:Destroy() end)
+    end
+
+    function Window:SetNotificationPosition(pos)
+        self._notifPos = NOTIF_POSITIONS[pos] and pos or "bottomright"
+        local p = NOTIF_POSITIONS[self._notifPos]
+        if self._notifs then
+            self._notifs.AnchorPoint = p.anchor
+            self._notifs.Position = p.pos
+            self:_notifReflow()
+        end
+    end
+
+    -- cfg: { Title, Message / Content, Type = "info"|"success"|"warning"|"error",
+    --        Duration (0 = stays until dismissed), Color = Color3,
+    --        Icon = "!" or "rbxassetid://..." } or a plain string.
+    -- Returns { Dismiss = function() end }.
     function Window:Notify(cfg)
         if type(cfg) == "string" then cfg = { Content = cfg } end
         cfg = cfg or {}
         self._notifId += 1
-        local nType = NOTIF_TYPES[cfg.Type] or NOTIF_TYPES.info
-        -- customization: cfg.Color overrides the type colour, cfg.Icon overrides
-        -- the glyph (text) or supplies "rbxassetid://..." for a custom image.
-        local accent = cfg.Color or nType.color or self.Theme.Accent
-        local iconText = cfg.Icon or nType.glyph
+        local theme = NOTIF_TYPES[string.lower(tostring(cfg.Type or "info"))] or NOTIF_TYPES.info
+        local color = cfg.Color or theme.color
+        local title = cfg.Title or "Notification"
+        local message = cfg.Message or cfg.Content or ""
+        local duration = tonumber(cfg.Duration)
+        duration = (duration == nil or duration < 0) and 5 or duration
+        local hasMsg = message ~= ""
+
+        -- responsive metrics (mobile friendly)
+        local cam = workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+        local compact = vp.X < 620
+        local width = math.floor(math.min(340, vp.X * 0.92))
+        self._notifWidth = width
+        if self._notifs then self._notifs.Size = UDim2.fromOffset(width, 100) end
+        local margin = compact and 12 or 18
+        local titleSize, bodySize = compact and 14 or 15, compact and 13 or 14
+        local textX = 54
+        local textW = width - textX - (compact and 44 or 40)
+
+        -- measure the message
+        local msgH = 0
+        if hasMsg then
+            local ok, size = pcall(function()
+                return TextService:GetTextSize(message, bodySize, Enum.Font.Gotham, Vector2.new(textW, 1000))
+            end)
+            msgH = (ok and size and size.Y or 16) + 2
+            msgH = math.max(msgH, 16)
+        end
+        local height = hasMsg and (14 + 18 + 4 + msgH + 22) or 58
+
+        -- cap the stack
+        self._activeNotifs = self._activeNotifs or {}
+        while #self._activeNotifs >= 4 do
+            self:_dismissNotif(self._activeNotifs[1])
+        end
+
+        local th = self.Theme
+        local cardTop, cardBot = th.Surface, th.Surface:Lerp(th.Background, 0.5)
+        local card = New("CanvasGroup", {
+            Parent = self._notifs, Size = UDim2.fromOffset(width, height),
+            Position = UDim2.fromOffset(width + 60, 0),
+            BackgroundColor3 = cardTop, BorderSizePixel = 0, GroupTransparency = 1,
+        })
+        New("UICorner", { CornerRadius = UDim.new(0, 14), Parent = card })
+        local grad = New("UIGradient", { Parent = card, Rotation = 90 })
+        self:_onTheme(card, function()
+            grad.Color = ColorSequence.new(self.Theme.Surface, self.Theme.Surface:Lerp(self.Theme.Background, 0.5))
+        end)
+        local stroke = New("UIStroke", { Parent = card, Thickness = 1, Transparency = 0.35 })
+        self:_bind(stroke, "Color", "Stroke")
+
+        -- tinted icon badge
+        local badge = New("Frame", {
+            Parent = card, Position = UDim2.fromOffset(16, hasMsg and 14 or (height / 2 - 13)),
+            Size = UDim2.fromOffset(26, 26), BackgroundColor3 = color,
+            BackgroundTransparency = 0.85, BorderSizePixel = 0,
+        })
+        New("UICorner", { CornerRadius = UDim.new(0, 13), Parent = badge })
+
+        local iconText = cfg.Icon or theme.glyph
         local iconAsset = type(iconText) == "string" and iconText:match("^rbxassetid://") or nil
-        local duration = math.max(0.5, tonumber(cfg.Duration) or 4)
-
-        -- layout slot in the stack
-        local wrap = New("Frame", {
-            Parent = self._notifs, BackgroundTransparency = 1,
-            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-            LayoutOrder = self._notifId,
-        })
-        local card = New("TextButton", {
-            Parent = wrap, Text = "", AutoButtonColor = false, BorderSizePixel = 0,
-            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-            BackgroundTransparency = 1, Position = UDim2.fromOffset(0, -12),
-        })
-        self:_bind(card, "BackgroundColor3", "Surface")
-        self:_glassify(card, 0.3)
-        self:_corner(card, 0.3)
-        local cardStroke = self:_stroke(card, "Stroke")
-        cardStroke.Transparency = 0.6
-
-        -- icon bubble with a soft accent gradient
-        local bubble = New("Frame", {
-            Parent = card, AnchorPoint = Vector2.new(0, 0), Position = UDim2.new(0, 12, 0, 12),
-            Size = UDim2.fromOffset(26, 26), BorderSizePixel = 0, BackgroundColor3 = Color3.new(1, 1, 1),
-        })
-        self:_corner(bubble, "pill")
-        self:_gradient(bubble, 25, 135, accent, shiftHue(accent, 25))
         if iconAsset then
             New("ImageLabel", {
-                Parent = bubble, BackgroundTransparency = 1, Image = iconAsset,
+                Parent = badge, BackgroundTransparency = 1, Image = iconAsset,
                 Size = UDim2.fromOffset(14, 14), AnchorPoint = Vector2.new(0.5, 0.5),
-                Position = UDim2.fromScale(0.5, 0.5), ImageColor3 = Color3.new(1, 1, 1),
+                Position = UDim2.fromScale(0.5, 0.5), ImageColor3 = color,
             })
+        elseif iconText == "check" or theme.glyph == "check" then
+            drawCheck(badge, color)
         else
-            local glyph = New("TextLabel", {
-                Parent = bubble, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
-                Text = tostring(iconText), Font = self:_font("Bold"), TextSize = self:_ts(12),
-                TextColor3 = Color3.new(1, 1, 1), TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+            New("TextLabel", {
+                Parent = badge, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+                Text = tostring(iconText), Font = self:_font("Bold"), TextSize = 16,
+                TextColor3 = color, TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
             })
-            self:_styleLabel(glyph, "Bold", 12)
         end
 
-        -- text column
-        local texts = New("Frame", {
-            Parent = card, BackgroundTransparency = 1,
-            Position = UDim2.new(0, 48, 0, 10), Size = UDim2.new(1, -78, 0, 0),
-            AutomaticSize = Enum.AutomaticSize.Y,
+        New("TextLabel", {
+            Parent = card, Position = UDim2.fromOffset(textX, hasMsg and 14 or (height / 2 - 9)),
+            Size = UDim2.fromOffset(textW, 18), BackgroundTransparency = 1,
+            Text = title, Font = self:_font("Bold"), TextSize = titleSize,
+            TextColor3 = th.Text, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
         })
-        New("UIListLayout", { Parent = texts, Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder })
-        local title = self:_text(texts, cfg.Title or "Notice", 13, self:_font("Bold"), "Text")
-        title.LayoutOrder = 1
-        if cfg.Content then
-            local content = self:_text(texts, cfg.Content, 12, self:_font("Normal"), "SubText")
-            content.LayoutOrder = 2
+        if hasMsg then
+            New("TextLabel", {
+                Parent = card, Position = UDim2.fromOffset(textX, 36),
+                Size = UDim2.fromOffset(textW, msgH), BackgroundTransparency = 1,
+                Text = message, Font = self:_font("Normal"), TextSize = bodySize,
+                TextColor3 = th.SubText, TextXAlignment = Enum.TextXAlignment.Left,
+                TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
+            })
         end
 
-        -- close button
-        local closeBtn = New("TextButton", {
-            Parent = card, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 8),
-            Size = UDim2.fromOffset(18, 18), BackgroundTransparency = 1, BorderSizePixel = 0,
-            Text = "×", Font = self:_font("Bold"), TextSize = self:_ts(15),
-            TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+        local n = { card = card, height = height, dismissed = false }
+
+        -- close button: 40x40 tap target
+        local close = New("TextButton", {
+            Parent = card, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -4, 0, 4),
+            Size = UDim2.fromOffset(40, 40), BackgroundTransparency = 1, Text = "×",
+            Font = self:_font("Bold"), TextSize = 20, TextColor3 = th.SubText, AutoButtonColor = false,
         })
-        self:_styleLabel(closeBtn, "Bold", 15)
-        self:_bind(closeBtn, "TextColor3", "SubText")
-        closeBtn.MouseEnter:Connect(function() tween(closeBtn, { TextColor3 = self.Theme.Text }) end)
-        closeBtn.MouseLeave:Connect(function() tween(closeBtn, { TextColor3 = self.Theme.SubText }) end)
+        close.MouseEnter:Connect(function() tween(close, { TextColor3 = th.Text }, TweenInfo.new(0.15)) end)
+        close.MouseLeave:Connect(function() tween(close, { TextColor3 = th.SubText }, TweenInfo.new(0.15)) end)
+        close.Activated:Connect(function() self:_dismissNotif(n) end)
 
-        -- progress line along the bottom edge
-        local bar = New("Frame", {
-            Parent = card, AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0),
-            Size = UDim2.new(1, 0, 0, 2), BorderSizePixel = 0, BackgroundColor3 = accent,
+        -- countdown bar
+        local track = New("Frame", {
+            Parent = card, Position = UDim2.new(0, 16, 1, -12), Size = UDim2.new(1, -32, 0, 3),
+            BackgroundColor3 = th.Elevated, BorderSizePixel = 0,
         })
-        if not nType.color then self:_bind(bar, "BackgroundColor3", "Accent") end
+        New("UICorner", { CornerRadius = UDim.new(0, 2), Parent = track })
+        local fill = New("Frame", {
+            Parent = track, Size = UDim2.fromScale(1, 1), BackgroundColor3 = color, BorderSizePixel = 0,
+        })
+        New("UICorner", { CornerRadius = UDim.new(0, 2), Parent = fill })
 
-        -- entrance: fade + rise + subtle scale pop
-        local restingT = (self._glass or 0) * 0.3
-        local pop = New("UIScale", { Parent = card, Scale = 0.96 })
-        tween(card, { Position = UDim2.fromOffset(0, 0), BackgroundTransparency = restingT }, TI_POP)
-        tween(pop, { Scale = 1 }, TI_POP)
-        tween(bar, { Size = UDim2.new(0, 0, 0, 2) }, TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out))
-
-        local dismissed = false
-        local function dismiss()
-            if dismissed then return end
-            dismissed = true
-            tween(card, { BackgroundTransparency = 1, Position = UDim2.fromOffset(0, -8) }, TI)
-            task.delay(0.18, function() if wrap.Parent then wrap:Destroy() end end)
+        local function setPaused(paused)
+            if n.dismissed or not n.barTween then return end
+            if paused then n.barTween:Pause() else n.barTween:Play() end
         end
-        closeBtn.MouseButton1Click:Connect(dismiss)
-        card.MouseButton1Click:Connect(dismiss)
-        task.delay(duration, dismiss)
+
+        if duration > 0 then
+            n.barTween = TweenService:Create(fill, TweenInfo.new(duration, Enum.EasingStyle.Linear), { Size = UDim2.fromScale(0, 1) })
+            n.barTween.Completed:Connect(function(state)
+                if state == Enum.PlaybackState.Completed then self:_dismissNotif(n) end
+            end)
+            n.barTween:Play()
+        else
+            track.Visible = false
+        end
+
+        -- desktop: hover pauses the countdown
+        card.MouseEnter:Connect(function() setPaused(true) end)
+        card.MouseLeave:Connect(function() setPaused(false) end)
+
+        -- touch: hold to pause, swipe right to dismiss
+        local touchStart, swiped = nil, false
+        card.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Touch then
+                touchStart, swiped = input.Position, false
+                setPaused(true)
+            end
+        end)
+        card.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Touch then
+                touchStart = nil
+                if not swiped then setPaused(false) end
+            end
+        end)
+        self:_connect(UserInputService.InputChanged, function(input)
+            if n.dismissed or not touchStart then return end
+            if input.UserInputType == Enum.UserInputType.Touch then
+                local dx = input.Position.X - touchStart.X
+                local dy = math.abs(input.Position.Y - touchStart.Y)
+                if dx > 55 and dy < 40 then
+                    swiped = true
+                    self:_dismissNotif(n)
+                end
+            end
+        end)
+
+        table.insert(self._activeNotifs, n)
+        self:_notifReflow()
+        TweenService:Create(card, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { GroupTransparency = 0 }):Play()
+
+        return { Dismiss = function() self:_dismissNotif(n) end }
     end
 
     function Window:AddTab(cfg)
@@ -2425,9 +2517,9 @@ local Prism = (function()
         end)
         self._blob, self._blobOn = blob, cfg.Blob == true
 
-        self._notifs = New("Frame", { Parent = gui, BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -20, 1, -20), Size = UDim2.new(0, 280, 1, -40) })
-        self._notifLayout = New("UIListLayout", { Parent = self._notifs, Padding = UDim.new(0, 8), VerticalAlignment = Enum.VerticalAlignment.Bottom, SortOrder = Enum.SortOrder.LayoutOrder })
+        self._notifs = New("Frame", { Parent = gui, BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -20, 1, -20), Size = UDim2.new(0, 340, 0, 100) })
         self._notifPos = "bottomright"
+        self._activeNotifs = {}
 
         -- resize handle
         if cfg.Resizable then
