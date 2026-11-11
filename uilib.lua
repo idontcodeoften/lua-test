@@ -623,7 +623,7 @@ local Prism = (function()
         end
 
         local th = self.Theme
-        local cardTop, cardBot = th.Surface, th.Surface:Lerp(th.Background, 0.5)
+        local cardTop, cardBot = th.Elevated, th.Surface
         local card = New("CanvasGroup", {
             Parent = self._notifs, Size = UDim2.fromOffset(width, height),
             Position = UDim2.fromOffset(width + 60, 0),
@@ -632,7 +632,7 @@ local Prism = (function()
         New("UICorner", { CornerRadius = UDim.new(0, 14), Parent = card })
         local grad = New("UIGradient", { Parent = card, Rotation = 90 })
         self:_onTheme(card, function()
-            grad.Color = ColorSequence.new(self.Theme.Surface, self.Theme.Surface:Lerp(self.Theme.Background, 0.5))
+            grad.Color = ColorSequence.new(self.Theme.Elevated, self.Theme.Surface)
         end)
         local stroke = New("UIStroke", { Parent = card, Thickness = 1, Transparency = 0.35 })
         self:_bind(stroke, "Color", "Stroke")
@@ -2550,7 +2550,7 @@ local Prism = (function()
             return false
         end
         self:_connect(UserInputService.InputBegan, function(i)
-            if not isPress(i) or self._minimized then return end
+            if not isPress(i) then return end
             local m = UserInputService:GetMouseLocation()
             local ap, as = holder.AbsolutePosition, holder.AbsoluteSize
             if m.X < ap.X or m.X > ap.X + as.X or m.Y < ap.Y or m.Y > ap.Y + as.Y then return end
