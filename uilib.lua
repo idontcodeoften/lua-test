@@ -38,6 +38,7 @@ local Prism = (function()
     local Players          = game:GetService("Players")
     local CoreGui          = game:GetService("CoreGui")
     local HttpService      = game:GetService("HttpService")
+    local TextService      = game:GetService("TextService")
     local RunService       = game:GetService("RunService")
 
     local Library = {}
@@ -163,6 +164,32 @@ local Prism = (function()
     local function shiftHue(c, deg)
         local h, s, v = Color3.toHSV(c)
         return Color3.fromHSV((h + deg / 360) % 1, s, v)
+    end
+
+    -- Drawn checkmark for success toasts (no icon asset needed).
+    local function drawCheck(parent, color, cx, cy)
+        for _, s in ipairs({
+            { x = cx - 3, y = cy + 1, len = 6,  rot = -45 },
+            { x = cx + 1, y = cy - 1, len = 11, rot = 45 },
+        }) do
+            local bar = New("Frame", {
+                Parent = parent, AnchorPoint = Vector2.new(0.5, 0.5),
+                Position = UDim2.fromOffset(s.x, s.y),
+                Size = UDim2.fromOffset(2, s.len),
+                Rotation = s.rot, BackgroundColor3 = color, BorderSizePixel = 0,
+            })
+            New("UICorner", { Parent = bar, CornerRadius = UDim.new(1, 0) })
+        end
+    end
+
+    -- Measure wrapped text height, with a fallback if TextService is unavailable.
+    local function measureTextHeight(text, size, width)
+        local ok, s = pcall(function()
+            return TextService:GetTextSize(text, size, Enum.Font.Gotham, Vector2.new(width, 1000))
+        end)
+        if ok and s and s.Y > 0 then return s.Y end
+        local lines = math.max(1, math.ceil(#text / math.max(1, math.floor(width / (size * 0.55)))))
+        return lines * (size + 4)
     end
 
     ------------------------------------------------------------------ window internals
