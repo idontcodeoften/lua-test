@@ -458,6 +458,7 @@ local Prism = (function()
         if state then
             self._minimizeToken = (self._minimizeToken or 0) + 1
             local token = self._minimizeToken
+            self._preMinimizePos = self.Holder.Position
             tween(self.Holder, { Size = UDim2.fromOffset(300, 72) }, TI_POP)
             task.delay(0.28, function()
                 if token == self._minimizeToken and self._minimized then
@@ -468,6 +469,8 @@ local Prism = (function()
             self._minimizeToken = (self._minimizeToken or 0) + 1
             self._body.Visible = true
             tween(self.Holder, { Size = UDim2.fromOffset(self._size.X, self._size.Y) }, TI_POP)
+            -- re-center the expanded window so it is always fully on screen
+            tween(self.Holder, { Position = UDim2.fromScale(0.5, 0.5) }, TI_POP)
         end
     end
 
@@ -562,7 +565,7 @@ local Prism = (function()
         if n.barTween then n.barTween:Cancel() end
         local out = TweenService:Create(n.card,
             TweenInfo.new(0.28, Enum.EasingStyle.Quint, Enum.EasingDirection.In),
-            { Position = UDim2.fromOffset((self._notifWidth or 340) + 60, n.card.Position.Y.Offset), GroupTransparency = 1 })
+            { Position = UDim2.fromOffset((self._notifWidth or 340) + 60, n.card.Position.Y.Offset) })
         out:Play()
         out.Completed:Once(function() n.card:Destroy() end)
     end
@@ -623,16 +626,17 @@ local Prism = (function()
         end
 
         local th = self.Theme
-        local cardTop, cardBot = th.Elevated, th.Surface
-        local card = New("CanvasGroup", {
+        -- UIGradient multiplies BackgroundColor3, so the card stays white and
+        -- the gradient supplies the elevated surface tones.
+        local card = New("Frame", {
             Parent = self._notifs, Size = UDim2.fromOffset(width, height),
             Position = UDim2.fromOffset(width + 60, 0),
-            BackgroundColor3 = cardTop, BorderSizePixel = 0, GroupTransparency = 1,
+            BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
         })
         New("UICorner", { CornerRadius = UDim.new(0, 14), Parent = card })
         local grad = New("UIGradient", { Parent = card, Rotation = 90 })
         self:_onTheme(card, function()
-            grad.Color = ColorSequence.new(self.Theme.Elevated, self.Theme.Surface)
+            grad.Color = ColorSequence.new(self.Theme.Elevated:Lerp(Color3.new(1, 1, 1), 0.10), self.Theme.Surface:Lerp(Color3.new(1, 1, 1), 0.07))
         end)
         local stroke = New("UIStroke", { Parent = card, Thickness = 1, Transparency = 0.35 })
         self:_bind(stroke, "Color", "Stroke")
@@ -694,7 +698,7 @@ local Prism = (function()
         -- countdown bar
         local track = New("Frame", {
             Parent = card, Position = UDim2.new(0, 16, 1, -12), Size = UDim2.new(1, -32, 0, 3),
-            BackgroundColor3 = th.Elevated, BorderSizePixel = 0,
+            BackgroundColor3 = th.Background, BorderSizePixel = 0,
         })
         New("UICorner", { CornerRadius = UDim.new(0, 2), Parent = track })
         local fill = New("Frame", {
@@ -749,7 +753,6 @@ local Prism = (function()
 
         table.insert(self._activeNotifs, n)
         self:_notifReflow()
-        TweenService:Create(card, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { GroupTransparency = 0 }):Play()
 
         return { Dismiss = function() self:_dismissNotif(n) end }
     end
@@ -1946,138 +1949,153 @@ local Prism = (function()
         return { Destroy = function() card:Destroy() end }
     end
 
+    -- Config manager: profile save / load / delete via executor file APIs,
+    -- plus clipboard export and JSON import. Mirrors the standalone module flow.
     function Tab:AddConfigSection(window)
         local w = window or self.Window
-        self:AddSection("Config")
-        local nameInput = self:AddInput({ Title = "Profile name", Placeholder = "MyConfig", Default = "default" })
-        local selectedProfile = ""
-        local profileDropdown
+        local CONFIG_FOLDER = "PrismConfigs"
+
+        -- status paragraph for feedback
         local status = self:AddParagraph({ Title = "Status", Description = "Ready." })
+        self:AddDivider()
+
+        if type(makefolder) == "function" and type(isfolder) == "function" then
+            if not isfolder(CONFIG_FOLDER) then pcall(makefolder, CONFIG_FOLDER) end
+        end
+
+        -- ==========================================
+        -- 1. PROFILE MANAGEMENT
+        -- ==========================================
+        self:AddSection("Profile Settings")
+
+        local nameInput = self:AddInput({
+            Title = "Profile name",
+            Placeholder = "e.g. MyConfig",
+            Default = "default",
+        })
+
         local function profilePath(name)
             if #name > 48 or not name:match("^[%w_-]+$") then
                 error("Use 1-48 letters, numbers, underscores, or hyphens for the profile name.")
             end
-            return "PrismConfigs/" .. name .. ".json"
+            return CONFIG_FOLDER .. "/" .. name .. ".json"
         end
+
         local function refreshProfiles()
-            if type(listfiles) ~= "function" then
-                status:Set("Profile list unavailable: executor does not expose listfiles.")
-                return
-            end
-            local ok, files = pcall(listfiles, "PrismConfigs")
-            if not ok then
-                if type(isfolder) == "function" then
-                    local folderOk, exists = pcall(isfolder, "PrismConfigs")
-                    if folderOk and not exists then files = {} else
-                        status:Set("Could not list profiles: " .. tostring(files))
-                        return
-                    end
-                else
-                    status:Set("Could not list profiles: " .. tostring(files))
-                    return
-                end
-            end
+            if type(listfiles) ~= "function" then return {} end
+            local ok, files = pcall(listfiles, CONFIG_FOLDER)
+            if not ok or not files then return {} end
             local names = {}
             for _, file in ipairs(files) do
-                local name = tostring(file):match("[^/\\]+%.json$")
-                if name then table.insert(names, name:gsub("%.json$", "")) end
+                local name = tostring(file):match("([^/\\]+)%.json$")
+                if name then table.insert(names, name) end
             end
             table.sort(names)
-            if #names == 0 then names = { "No profiles found" } end
-            selectedProfile = names[1]
-            if profileDropdown then
-                profileDropdown:SetValues(names)
-                profileDropdown:Set(selectedProfile)
-            else
-                profileDropdown = self:AddDropdown({
-                    Title = "Select profile",
-                    Values = names,
-                    Default = selectedProfile,
-                    Callback = function(value) selectedProfile = value end,
-                })
-            end
+            return names
         end
-        local function saveProfile()
-            local name = nameInput:Get()
-            if name == "" then name = "default" end
-            local path = profilePath(name)
-            if type(writefile) ~= "function" then error("executor does not expose writefile") end
-            if type(makefolder) == "function" and type(isfolder) == "function" then
-                local folderOk, exists = pcall(isfolder, "PrismConfigs")
-                if not folderOk then error("could not check PrismConfigs folder: " .. tostring(exists)) end
-                if not exists then makefolder("PrismConfigs") end
-            end
-            local json = HttpService:JSONEncode(w:_collectState())
-            writefile(path, json)
-            selectedProfile = name
-            refreshProfiles()
-            if profileDropdown then profileDropdown:Set(name) end
-        end
-        local function loadProfile()
-            local name = selectedProfile
-            if name == "" or name == "No profiles found" then error("select a saved profile first") end
-            local path = profilePath(name)
-            if type(readfile) ~= "function" or type(isfile) ~= "function" then
-                error("executor does not expose readfile/isfile")
-            end
-            if not isfile(path) then error("profile file not found: " .. path) end
-            local data = HttpService:JSONDecode(readfile(path))
-            w:_applyState(data)
-            nameInput:Set(name)
-        end
+
+        local selectedProfile = ""
+        local profileDropdown = self:AddDropdown({
+            Title = "Saved profiles",
+            Values = (function() local n = refreshProfiles() return #n > 0 and n or { "No configs found" } end)(),
+            Default = "",
+            Callback = function(value) selectedProfile = value end,
+        })
+
         local function report(action, ok, detail)
             status:Set(ok and (action .. " successfully.") or (action .. " failed: " .. tostring(detail)))
             w:Notify({
                 Title = ok and (action .. " complete") or (action .. " failed"),
-                Content = ok and ("Profile " .. action:lower() .. " successfully.") or tostring(detail),
+                Message = ok and ("Profile " .. action:lower() .. " successfully.") or tostring(detail),
                 Type = ok and "success" or "error",
                 Duration = 3,
             })
         end
+
         self:AddButton({
             Title = "Save profile",
             Description = "Save the current interface and widget values.",
             Callback = function()
-                local ok, err = pcall(saveProfile)
+                local ok, err = pcall(function()
+                    local saveName = nameInput:Get()
+                    if saveName == "" then saveName = selectedProfile end
+                    if saveName == "" or saveName == "No configs found" then
+                        error("enter a profile name first")
+                    end
+                    if type(writefile) ~= "function" then error("executor does not expose writefile") end
+                    local path = profilePath(saveName)
+                    if type(makefolder) == "function" and type(isfolder) == "function" then
+                        local folderOk, exists = pcall(isfolder, CONFIG_FOLDER)
+                        if folderOk and not exists then makefolder(CONFIG_FOLDER) end
+                    end
+                    writefile(path, HttpService:JSONEncode(w:_collectState()))
+                    profileDropdown:SetValues(refreshProfiles())
+                    profileDropdown:Set(saveName)
+                    selectedProfile = saveName
+                end)
                 report("Save", ok, err)
             end,
         })
+
         self:AddButton({
             Title = "Load selected profile",
             Callback = function()
-                local ok, err = pcall(loadProfile)
+                local ok, err = pcall(function()
+                    if selectedProfile == "" or selectedProfile == "No configs found" then
+                        error("select a profile first")
+                    end
+                    local path = profilePath(selectedProfile)
+                    if type(isfile) ~= "function" or type(readfile) ~= "function" then
+                        error("executor does not expose readfile/isfile")
+                    end
+                    if not isfile(path) then error("file not found: " .. path) end
+                    local data = HttpService:JSONDecode(readfile(path))
+                    if type(data) ~= "table" then error("invalid config data") end
+                    w:_applyState(data)
+                    nameInput:Set(selectedProfile)
+                end)
                 report("Load", ok, err)
             end,
         })
+
         self:AddButton({
             Title = "Delete selected profile",
             Callback = function()
                 local ok, err = pcall(function()
-                    if selectedProfile == "" or selectedProfile == "No profiles found" then
-                        error("select a saved profile first")
+                    if selectedProfile == "" or selectedProfile == "No configs found" then
+                        error("select a profile to delete")
                     end
-                    if type(delfile) ~= "function" or type(isfile) ~= "function" then
-                        error("executor does not expose delfile/isfile")
-                    end
-                    local path = profilePath(selectedProfile)
-                    if not isfile(path) then error("profile file not found: " .. path) end
-                    delfile(path)
-                    refreshProfiles()
+                    if type(delfile) ~= "function" then error("executor does not expose delfile") end
+                    local okDel, errDel = pcall(delfile, profilePath(selectedProfile))
+                    if not okDel then error(errDel) end
+                    selectedProfile = ""
+                    profileDropdown:SetValues(refreshProfiles())
                 end)
                 report("Delete", ok, err)
             end,
         })
+
         self:AddButton({
             Title = "Refresh profiles",
-            Callback = refreshProfiles,
+            Callback = function()
+                local names = refreshProfiles()
+                profileDropdown:SetValues(#names > 0 and names or { "No configs found" })
+                status:Set(#names > 0 and ("Found " .. #names .. " profile(s).") or "No configs found.")
+            end,
         })
+
+        -- ==========================================
+        -- 2. IMPORT / EXPORT
+        -- ==========================================
+        self:AddSection("Import / Export")
+
         self:AddButton({
-            Title = "Export profile JSON",
+            Title = "Export to clipboard",
             Callback = function()
                 local ok, result = pcall(function() return HttpService:JSONEncode(w:_collectState()) end)
                 if not ok then
                     status:Set("Export failed: " .. tostring(result))
-                    w:Notify({ Title = "Export failed", Content = tostring(result), Type = "error", Duration = 3 })
+                    w:Notify({ Title = "Export failed", Message = tostring(result), Type = "error", Duration = 3 })
                     return
                 end
                 if type(setclipboard) == "function" then
@@ -2089,7 +2107,26 @@ local Prism = (function()
                 end
             end,
         })
-        refreshProfiles()
+
+        local importBox = self:AddCodeBox({
+            Title = "Import JSON",
+            Placeholder = "Paste config JSON here...",
+            Height = 110,
+        })
+
+        self:AddButton({
+            Title = "Apply imported JSON",
+            Callback = function()
+                local ok, err = pcall(function()
+                    local raw = importBox:Get()
+                    if raw == "" or not raw:match("%S") then error("paste JSON first") end
+                    local data = HttpService:JSONDecode(raw)
+                    if type(data) ~= "table" then error("invalid JSON format") end
+                    w:_applyState(data)
+                end)
+                report("Import", ok, err)
+            end,
+        })
     end
 
     ------------------------------------------------------------------ window creation
@@ -2525,7 +2562,7 @@ local Prism = (function()
         if cfg.Resizable then
             local handle = New("TextButton", { Parent = holder, Text = "", Size = UDim2.fromOffset(16, 16), Position = UDim2.new(1, -14, 1, -14), BackgroundTransparency = 1, ZIndex = 5 })
             local resize = false
-            handle.InputBegan:Connect(function(i) if isPress(i) then resize = true end end)
+            handle.InputBegan:Connect(function(i) if isPress(i) and not self._minimized then resize = true end end)
             self:_connect(UserInputService.InputChanged, function(i)
                 if resize and isMove(i) then
                     local sx = i.Position.X - holder.AbsolutePosition.X
