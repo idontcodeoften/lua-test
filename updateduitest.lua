@@ -1,5 +1,5 @@
 --[[
-    PrismUI v1.5 - executor single-file build
+    PrismUI v1.6 - executor single-file build
     Load from a hosted raw file:
     local Prism = loadstring(game:HttpGet("RAW_GITHUB_URL"))()
     local Window = Prism:CreateWindow({
@@ -19,6 +19,20 @@
         Rainbow = false,              -- slow hue-cycling accent
         Profile = true,               -- player card at the bottom of the sidebar
     })
+
+    What's new in v1.6
+      * Prism:CreateKeySystem({ Title, Subtitle, Note, Identifier, Provider, Service, SaveKey,
+        Verify = function(key) -> ok, msg end, Copy = function() -> link end,
+        OnVerified = function(key) end, OnInvalid = function(msg) end })
+        returns { Window, Verify(key), Copy(), IsVerified(), Reset(), Prompt() }.
+        Same API as the Junkie key system build; uses the new key prompt and now
+        rejects keys when the key service can't be reached instead of letting them in.
+        Prism:RegisterKeyProvider(id, spec) / RegisterCustomProvider(id, name, verify, copy)
+        / RegisterHttpProvider(id, spec); pick one with cfg.KeyProvider = id.
+      * Colour picker: saturation/brightness square, hue bar, optional transparency bar
+        (Transparency = 0..1), old/new preview, hex + R/G/B fields, preset swatches,
+        recent colours, Live = true for live callbacks. Callback(color, transparency).
+        Works with touch and no longer drags the window while picking.
 
     What's new in v1.5
       * Key system: cfg.KeySystem = { Title, Note, Keys = {...} or Validate = function(key) -> ok, msg,
@@ -738,6 +752,7 @@ local Prism = (function()
     -- ks: { Title, Note, Keys = {..} | Key = "..", Validate = function(key) -> ok, msg (may yield),
     --       Link, SaveKey = true, FileName = "key", OnSuccess = function(key) end }
     function Window:_keyFile(ks)
+        if ks.Path then return ks.Path end
         local name = tostring(ks.FileName or "key"):gsub("[^%w_-]", "")
         return CONFIG_FOLDER .. "/" .. (name ~= "" and name or "key") .. ".txt"
     end
@@ -761,9 +776,18 @@ local Prism = (function()
         self._locked = false
         if ks.SaveKey ~= false and type(writefile) == "function" then
             pcall(function()
-                if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder(CONFIG_FOLDER) then makefolder(CONFIG_FOLDER) end
+                local folder = ks.Folder or CONFIG_FOLDER
+                if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder(folder) then makefolder(folder) end
                 writefile(self:_keyFile(ks), key)
             end)
+        end
+        if ks.Standalone then
+            -- CreateKeySystem: the prompt is the whole UI; close it, then hand over
+            task.delay(0.25, function()
+                self:Destroy()
+                safe(ks.OnSuccess, key)
+            end)
+            return
         end
         local gate = self._gate
         self._gate = nil
@@ -863,7 +887,7 @@ local Prism = (function()
         end
 
         local row = New("Frame", { Parent = card, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, boxH), LayoutOrder = 5, ZIndex = 41 })
-        local hasLink = ks.Link ~= nil and ks.Link ~= ""
+        local hasLink = (ks.Link ~= nil and ks.Link ~= "") or type(ks.Copy) == "function"
         local function mkBtn(text, primary, x, wScale)
             local b = New("TextButton", {
                 Parent = row, Position = UDim2.new(x, x > 0 and 5 or 0, 0, 0), Size = UDim2.new(wScale, hasLink and -5 or 0, 1, 0),
@@ -884,11 +908,18 @@ local Prism = (function()
         if hasLink then
             local getBtn = mkBtn("Get key", false, 0, 0.5)
             getBtn.Activated:Connect(function()
+                local link = ks.Link
+                if type(ks.Copy) == "function" then
+                    say("Getting the key link...")
+                    local ok, l = pcall(ks.Copy)
+                    link = (ok and type(l) == "string" and l ~= "") and l or nil
+                end
+                if not link then say("The key link isn't available right now.", "error") return end
                 if type(setclipboard) == "function" then
-                    pcall(setclipboard, tostring(ks.Link))
-                    say("Link copied to your clipboard.", "success")
+                    pcall(setclipboard, tostring(link))
+                    say("Key link copied to your clipboard.", "success")
                 else
-                    say(tostring(ks.Link))
+                    say(tostring(link))
                 end
             end)
         end
@@ -919,8 +950,18 @@ local Prism = (function()
                 else
                     say(msg, "error")
                     shake()
+                    safe(ks.OnInvalid, msg)
                 end
             end)
+        end
+        if ks.Footer and ks.Footer ~= "" then
+            local foot = New("TextLabel", {
+                Parent = card, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+                Text = tostring(ks.Footer), Font = self:_font("Normal"), TextSize = self:_ts(11), TextWrapped = true,
+                TextXAlignment = Enum.TextXAlignment.Center, LayoutOrder = 6, ZIndex = 41,
+            })
+            self:_styleLabel(foot, "Normal", 11); self:_bind(foot, "TextColor3", "SubText")
+            foot.TextTransparency = 0.25
         end
         submit.Activated:Connect(trySubmit)
         box.FocusLost:Connect(function(enter) if enter then trySubmit() end end)
@@ -2583,172 +2624,310 @@ local Prism = (function()
         return self:_registerState(cfg, obj)
     end
 
+    local DEFAULT_SWATCHES = {
+        rgb(239, 68, 68), rgb(249, 115, 22), rgb(251, 191, 36), rgb(163, 230, 53), rgb(52, 211, 153),
+        rgb(34, 211, 238), rgb(59, 130, 246), rgb(129, 102, 255), rgb(217, 70, 239), rgb(244, 114, 182),
+        rgb(255, 255, 255), rgb(148, 163, 184), rgb(71, 85, 105), rgb(24, 24, 30),
+    }
+
+    -- cfg: Title, Description, Default = Color3, Transparency = 0..1 (adds a transparency bar),
+    --      Swatches = { Color3 }, Live = true (callback while dragging), Callback(color, transparency)
     function Tab:AddColorPicker(cfg)
         local w = self.Window
-        local card, header = self:_card(cfg, 44)
-        local current = cfg.Default or Color3.fromRGB(129, 102, 255)
-        local swatch = New("TextButton", rightAnchored({ Parent = header, Size = UDim2.fromOffset(40, 24), Text = "", AutoButtonColor = false }))
-        w:_corner(swatch, 0.4)
+        local tab = self
+        local touch = w._touch
+        local card, header = self:_card(cfg, 52)
+        local useAlpha = cfg.Transparency ~= nil
+        local alpha = math.clamp(tonumber(cfg.Transparency) or 0, 0, 1)
+        local color = cfg.Default or rgb(129, 102, 255)
+        local h, s, v = Color3.toHSV(color)
+        local committed = color
+        w._recentColors = w._recentColors or {}
+
+        -- header swatch (tap to open)
+        local swatch = New("TextButton", rightAnchored({ Parent = header, Size = UDim2.fromOffset(44, touch and 30 or 24), Text = "", AutoButtonColor = false }))
+        w:_corner(swatch, 0.6)
+        local swStroke = w:_stroke(swatch, "Stroke"); swStroke.Transparency = 0.1
+        local swFill = New("Frame", { Parent = swatch, Size = UDim2.fromScale(1, 1), BorderSizePixel = 0 })
+        w:_corner(swFill, 0.6)
         w:_bind(swatch, "BackgroundColor3", "Elevated")
-        local fill = New("Frame", { Parent = swatch, Size = UDim2.fromScale(1, 1), BorderSizePixel = 0 })
-        w:_corner(fill, 0.4)
-        local swStroke = New("UIStroke", { Parent = swatch, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
-        w:_bind(swStroke, "Color", "Stroke")
 
-        local picker = New("Frame", { Parent = card, Visible = false, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2, BackgroundTransparency = 1 })
-        New("UIListLayout", { Parent = picker, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder })
+        local panel = New("Frame", { Parent = card, Visible = false, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2 })
+        pad(panel, 4, 0, 2, 0)
+        New("UIListLayout", { Parent = panel, Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder })
 
-        local hexBox = New("TextBox", { Parent = picker, Size = UDim2.new(1, 0, 0, 26), Text = color3ToHex(current), Font = w:_font("Medium"), TextSize = w:_ts(12), ClearTextOnFocus = false, LayoutOrder = 1 })
-        w:_styleLabel(hexBox, "Medium", 12)
-        pad(hexBox, 0, 9, 0, 9)
-        w:_corner(hexBox, 0.4)
-        w:_bind(hexBox, "BackgroundColor3", "Elevated")
-        w:_bind(hexBox, "TextColor3", "Text")
-
-        local function makeBar(label, init, color)
-            local row = New("Frame", { Parent = picker, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 22), LayoutOrder = #picker:GetChildren() + 1 })
-            local lbl = New("TextLabel", { Parent = row, BackgroundTransparency = 1, Size = UDim2.new(0, 18, 1, 0), Text = label, Font = w:_font("Bold"), TextSize = w:_ts(10), TextXAlignment = Enum.TextXAlignment.Left })
-            w:_styleLabel(lbl, "Bold", 10)
-            w:_bind(lbl, "TextColor3", "SubText")
-
-            local hit = New("TextButton", { Parent = row, Text = "", BackgroundTransparency = 1, Position = UDim2.fromOffset(24, 2), Size = UDim2.new(1, -24, 0, 12), AutoButtonColor = false })
-            local bar = New("Frame", { Parent = hit, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0) })
-            w:_corner(bar, "pill")
-            w:_bind(bar, "BackgroundColor3", "Elevated")
-
-            local f = New("Frame", { Parent = bar, BorderSizePixel = 0, Size = UDim2.new(init, 0, 1, 0) })
-            w:_corner(f, "pill")
-            f.BackgroundColor3 = color or Color3.new(1, 1, 1)
-
-            return f, hit, bar
+        local WHITE, BLACK = Color3.new(1, 1, 1), Color3.new(0, 0, 0)
+        local function ring(parent, size, z)
+            local f = New("Frame", { Parent = parent, AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(size, size), BorderSizePixel = 0, ZIndex = z or 3 })
+            New("UICorner", { Parent = f, CornerRadius = UDim.new(1, 0) })
+            New("UIStroke", { Parent = f, Color = WHITE, Thickness = 2.5 })
+            return f
         end
 
-        local rFill, rHit, rBar = makeBar("R", current.R, Color3.fromRGB(255, 0, 0))
-        local gFill, gHit, gBar = makeBar("G", current.G, Color3.fromRGB(0, 255, 0))
-        local bFill, bHit, bBar = makeBar("B", current.B, Color3.fromRGB(0, 0, 255))
+        -- saturation / brightness square
+        local sv = New("TextButton", { Parent = panel, Text = "", AutoButtonColor = false, Size = UDim2.new(1, 0, 0, touch and 150 or 128), BorderSizePixel = 0, BackgroundColor3 = WHITE, LayoutOrder = 1 })
+        w:_corner(sv, 0.7)
+        local svSat = New("UIGradient", { Parent = sv })
+        local shade = New("Frame", { Parent = sv, Size = UDim2.fromScale(1, 1), BackgroundColor3 = BLACK, BorderSizePixel = 0 })
+        w:_corner(shade, 0.7)
+        New("UIGradient", { Parent = shade, Rotation = 90, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0) }) })
+        local svCursor = ring(sv, touch and 18 or 14)
 
-        -- HSV palette: saturation/value square + hue bar
-        local hsvH, hsvS, hsvV = Color3.toHSV(current)
-        local svArea = New("Frame", { Parent = picker, Size = UDim2.new(1, 0, 0, 110), BorderSizePixel = 0, LayoutOrder = #picker:GetChildren() + 1, BackgroundColor3 = Color3.fromHSV(hsvH, 1, 1) })
-        w:_corner(svArea, 0.3)
-        local svWhite = New("UIGradient", { Parent = svArea, Rotation = 0, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromHSV(hsvH, 1, 1)) })
-        local svBlack = New("Frame", { Parent = svArea, Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0 })
-        w:_corner(svBlack, 0.3)
-        New("UIGradient", { Parent = svBlack, Rotation = 90, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0) }) })
-        local svCursor = New("Frame", { Parent = svArea, AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(10, 10), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 3 })
-        New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = svCursor })
-        New("UIStroke", { Parent = svCursor, Thickness = 1.5, Color = Color3.new(0, 0, 0), Transparency = 0.4 })
-
-        local hueHit = New("TextButton", { Parent = picker, Text = "", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 14), LayoutOrder = #picker:GetChildren() + 1, AutoButtonColor = false })
-        local hueBar = New("Frame", { Parent = hueHit, Size = UDim2.fromScale(1, 1), BorderSizePixel = 0 })
-        w:_corner(hueBar, "pill")
-        New("UIGradient", { Parent = hueBar, Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0.00, Color3.fromRGB(255, 0, 0)),
-            ColorSequenceKeypoint.new(0.17, Color3.fromRGB(255, 255, 0)),
-            ColorSequenceKeypoint.new(0.33, Color3.fromRGB(0, 255, 0)),
-            ColorSequenceKeypoint.new(0.50, Color3.fromRGB(0, 255, 255)),
-            ColorSequenceKeypoint.new(0.67, Color3.fromRGB(0, 0, 255)),
-            ColorSequenceKeypoint.new(0.83, Color3.fromRGB(255, 0, 255)),
-            ColorSequenceKeypoint.new(1.00, Color3.fromRGB(255, 0, 0)),
+        -- hue bar
+        local barH = touch and 16 or 12
+        local hue = New("TextButton", { Parent = panel, Text = "", AutoButtonColor = false, Size = UDim2.new(1, 0, 0, barH), BorderSizePixel = 0, BackgroundColor3 = WHITE, LayoutOrder = 2 })
+        w:_corner(hue, "pill")
+        New("UIGradient", { Parent = hue, Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0.00, rgb(255, 0, 0)),   ColorSequenceKeypoint.new(0.17, rgb(255, 255, 0)),
+            ColorSequenceKeypoint.new(0.33, rgb(0, 255, 0)),   ColorSequenceKeypoint.new(0.50, rgb(0, 255, 255)),
+            ColorSequenceKeypoint.new(0.67, rgb(0, 0, 255)),   ColorSequenceKeypoint.new(0.83, rgb(255, 0, 255)),
+            ColorSequenceKeypoint.new(1.00, rgb(255, 0, 0)),
         }) })
-        local hueCursor = New("Frame", { Parent = hueHit, AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(5, 18), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 3 })
-        New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = hueCursor })
-        New("UIStroke", { Parent = hueCursor, Thickness = 1, Color = Color3.new(0, 0, 0), Transparency = 0.4 })
+        local hueCursor = ring(hue, barH + 6)
 
-        local function update(v)
-            current = v
-            fill.BackgroundColor3 = current
-            hexBox.Text = color3ToHex(current)
-            rFill.Size = UDim2.new(current.R, 0, 1, 0)
-            gFill.Size = UDim2.new(current.G, 0, 1, 0)
-            bFill.Size = UDim2.new(current.B, 0, 1, 0)
-            hsvH, hsvS, hsvV = Color3.toHSV(current)
-            svArea.BackgroundColor3 = Color3.fromHSV(hsvH, 1, 1)
-            svWhite.Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromHSV(hsvH, 1, 1))
-            svCursor.Position = UDim2.new(hsvS, 0, 1 - hsvV, 0)
-            hueCursor.Position = UDim2.new(hsvH, 0, 0.5, 0)
+        -- transparency bar (optional): transparent on the left, solid on the right
+        local alphaBar, alphaFill, alphaCursor
+        if useAlpha then
+            alphaBar = New("TextButton", { Parent = panel, Text = "", AutoButtonColor = false, Size = UDim2.new(1, 0, 0, barH), BorderSizePixel = 0, LayoutOrder = 3 })
+            w:_corner(alphaBar, "pill")
+            w:_bind(alphaBar, "BackgroundColor3", "Elevated")
+            -- simple checker hint behind the fill
+            for i = 0, 15 do
+                local sq = New("Frame", { Parent = alphaBar, Position = UDim2.new(i / 16, 0, i % 2 == 0 and 0 or 0.5, 0), Size = UDim2.new(1 / 16, 0, 0.5, 0), BorderSizePixel = 0, BackgroundTransparency = 0.6 })
+                w:_bind(sq, "BackgroundColor3", "Stroke")
+            end
+            alphaFill = New("Frame", { Parent = alphaBar, Size = UDim2.fromScale(1, 1), BorderSizePixel = 0, ZIndex = 2 })
+            w:_corner(alphaFill, "pill")
+            New("UIGradient", { Parent = alphaFill, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0) }) })
+            alphaCursor = ring(alphaBar, barH + 6, 4)
         end
 
-        local function push()
-            safe(cfg.Callback, current)
+        -- preview + hex + R/G/B
+        local rowH = touch and 34 or 28
+        local row = New("Frame", { Parent = panel, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, rowH), LayoutOrder = 4 })
+        New("UIListLayout", { Parent = row, FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder })
+        local preview = New("Frame", { Parent = row, Size = UDim2.fromOffset(rowH + 10, rowH), BorderSizePixel = 0, LayoutOrder = 1, ClipsDescendants = true })
+        w:_corner(preview, 0.6)
+        local pvStroke = w:_stroke(preview, "Stroke"); pvStroke.Transparency = 0.2
+        local oldHalf = New("Frame", { Parent = preview, Size = UDim2.fromScale(0.5, 1), BorderSizePixel = 0 })
+        local newHalf = New("Frame", { Parent = preview, Position = UDim2.fromScale(0.5, 0), Size = UDim2.fromScale(0.5, 1), BorderSizePixel = 0 })
+        local chanW = touch and 46 or 42
+        local function field(text, width, order)
+            local b = New("TextBox", {
+                Parent = row, Size = width, Text = text, Font = w:_font("Medium"), TextSize = w:_ts(12),
+                ClearTextOnFocus = false, BorderSizePixel = 0, LayoutOrder = order, ClipsDescendants = true,
+            })
+            w:_styleLabel(b, "Medium", 12)
+            w:_corner(b, 0.6)
+            w:_bind(b, "BackgroundColor3", "Elevated"); w:_bind(b, "TextColor3", "Text"); w:_bind(b, "PlaceholderColor3", "SubText")
+            local st = w:_stroke(b, "Accent"); st.Transparency = 1
+            b.Focused:Connect(function() tween(st, { Transparency = 0.2 }) end)
+            b.FocusLost:Connect(function() tween(st, { Transparency = 1 }) end)
+            return b
+        end
+        local hexBox = field("", UDim2.new(1, -(rowH + 10 + chanW * 3 + 24), 0, rowH), 2)
+        local chans = {}
+        for i, ch in ipairs({ "R", "G", "B" }) do
+            local b = field("", UDim2.fromOffset(chanW, rowH), 2 + i)
+            b.PlaceholderText = ch
+            pad(b, 0, 4, 0, 12)
+            local tag = New("TextLabel", { Parent = b, BackgroundTransparency = 1, Position = UDim2.fromOffset(-8, 0), Size = UDim2.new(0, 8, 1, 0), Text = ch, Font = w:_font("Bold"), TextSize = w:_ts(9), TextXAlignment = Enum.TextXAlignment.Left })
+            w:_bind(tag, "TextColor3", "SubText")
+            chans[ch] = b
         end
 
-        local function track(fillF, hitF, barF, chan)
-            local drag = false
-            hitF.InputBegan:Connect(function(i)
-                if isPress(i) then drag = true end
+        -- swatches
+        local cell = touch and 28 or 22
+        local function grid(order)
+            local f = New("Frame", { Parent = panel, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = order })
+            New("UIGridLayout", { Parent = f, CellSize = UDim2.fromOffset(cell, cell), CellPadding = UDim2.fromOffset(7, 7), SortOrder = Enum.SortOrder.LayoutOrder })
+            return f
+        end
+        local presets = grid(5)
+        local recentLabel = New("TextLabel", { Parent = panel, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 12), Text = "RECENT", Font = w:_font("Bold"), TextSize = w:_ts(9), TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 6, Visible = false })
+        w:_styleLabel(recentLabel, "Bold", 9); w:_bind(recentLabel, "TextColor3", "SubText")
+        local recent = grid(7)
+
+        local obj = {}
+        local refresh, commit
+        local function setHSV(nh, ns, nv)
+            -- keep the hue when the colour is grey/black so the square doesn't jump
+            if ns > 0.001 and nv > 0.001 then h = nh end
+            s, v = ns, nv
+        end
+        local function addSwatch(parent, c, order)
+            local b = New("TextButton", { Parent = parent, Text = "", AutoButtonColor = false, BackgroundColor3 = c, BorderSizePixel = 0, LayoutOrder = order })
+            New("UICorner", { Parent = b, CornerRadius = UDim.new(1, 0) })
+            local st = New("UIStroke", { Parent = b, Thickness = 1, Transparency = 0.5 })
+            w:_bind(st, "Color", "Stroke")
+            local sc = New("UIScale", { Parent = b })
+            b.MouseEnter:Connect(function() if not touch then tween(sc, { Scale = 1.12 }) end end)
+            b.MouseLeave:Connect(function() tween(sc, { Scale = 1 }) end)
+            b.Activated:Connect(function()
+                local nh, ns, nv = Color3.toHSV(c)
+                setHSV(nh, ns, nv)
+                commit()
             end)
-            w:_connect(UserInputService.InputChanged, function(i)
-                if drag and isMove(i) then
-                    local a = math.clamp((i.Position.X - barF.AbsolutePosition.X) / math.max(barF.AbsoluteSize.X, 1), 0, 1)
-                    fillF.Size = UDim2.new(a, 0, 1, 0)
-                    local c = Color3.new(
-                        chan == "R" and a or current.R,
-                        chan == "G" and a or current.G,
-                        chan == "B" and a or current.B
-                    )
-                    update(c)
-                end
-            end)
-            w:_connect(UserInputService.InputEnded, function(i)
-                if isPress(i) then
-                    if drag then push() end
-                    drag = false
-                end
-            end)
+        end
+        for i, c in ipairs(cfg.Swatches or DEFAULT_SWATCHES) do addSwatch(presets, c, i) end
+        local function rebuildRecent()
+            for _, c in ipairs(recent:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
+            for i, c in ipairs(w._recentColors) do addSwatch(recent, c, i) end
+            recentLabel.Visible = #w._recentColors > 0
+        end
+        local function remember(c)
+            local hex = color3ToHex(c)
+            for i = #w._recentColors, 1, -1 do
+                if color3ToHex(w._recentColors[i]) == hex then table.remove(w._recentColors, i) end
+            end
+            table.insert(w._recentColors, 1, c)
+            while #w._recentColors > 7 do table.remove(w._recentColors) end
         end
 
-        track(rFill, rHit, rBar, "R")
-        track(gFill, gHit, gBar, "G")
-        track(bFill, bHit, bBar, "B")
-
-        -- SV square dragging
-        local svDrag = false
-        local function svFromInput(i)
-            local ap, as = svArea.AbsolutePosition, svArea.AbsoluteSize
-            local s = math.clamp((i.Position.X - ap.X) / math.max(as.X, 1), 0, 1)
-            local v = 1 - math.clamp((i.Position.Y - ap.Y) / math.max(as.Y, 1), 0, 1)
-            return s, v
+        refresh = function()
+            color = Color3.fromHSV(h, s, v)
+            local pure = Color3.fromHSV(h, 1, 1)
+            swFill.BackgroundColor3 = color
+            swFill.BackgroundTransparency = alpha
+            svSat.Color = ColorSequence.new(WHITE, pure)
+            svCursor.Position = UDim2.new(s, 0, 1 - v, 0)
+            svCursor.BackgroundColor3 = color
+            hueCursor.Position = UDim2.new(h, 0, 0.5, 0)
+            hueCursor.BackgroundColor3 = pure
+            if alphaBar then
+                alphaFill.BackgroundColor3 = color
+                alphaCursor.Position = UDim2.new(1 - alpha, 0, 0.5, 0)
+                alphaCursor.BackgroundColor3 = color
+            end
+            oldHalf.BackgroundColor3 = committed
+            newHalf.BackgroundColor3 = color
+            if not hexBox:IsFocused() then hexBox.Text = color3ToHex(color) end
+            local rgbVals = { R = color.R, G = color.G, B = color.B }
+            for ch, b in pairs(chans) do
+                if not b:IsFocused() then b.Text = tostring(math.floor(rgbVals[ch] * 255 + 0.5)) end
+            end
         end
-        svArea.InputBegan:Connect(function(i)
-            if isPress(i) then svDrag = true; local s, v = svFromInput(i); update(Color3.fromHSV(hsvH, s, v)) end
-        end)
+        commit = function(silent)
+            committed = color
+            refresh()
+            remember(color)
+            if panel.Visible then rebuildRecent() end
+            if not silent then safe(cfg.Callback, color, alpha) end
+        end
+
+        -- dragging (mouse + touch); the page stops scrolling while you drag
+        local dragKind, dragInput = nil, nil
+        local function apply(kind, pos)
+            if kind == "sv" then
+                local ap, as = sv.AbsolutePosition, sv.AbsoluteSize
+                s = math.clamp((pos.X - ap.X) / math.max(as.X, 1), 0, 1)
+                v = 1 - math.clamp((pos.Y - ap.Y) / math.max(as.Y, 1), 0, 1)
+            elseif kind == "hue" then
+                h = math.clamp((pos.X - hue.AbsolutePosition.X) / math.max(hue.AbsoluteSize.X, 1), 0, 0.999)
+            elseif kind == "alpha" then
+                alpha = 1 - math.clamp((pos.X - alphaBar.AbsolutePosition.X) / math.max(alphaBar.AbsoluteSize.X, 1), 0, 1)
+            end
+            refresh()
+            if cfg.Live then safe(cfg.Callback, color, alpha) end
+        end
+        local function draggable(kind, target)
+            local cursor = kind == "sv" and svCursor or (kind == "hue" and hueCursor or alphaCursor)
+            target.InputBegan:Connect(function(i)
+                if not isPress(i) then return end
+                dragKind, dragInput = kind, i
+                tab.Page.ScrollingEnabled = false
+                local sz = cursor.Size.X.Offset
+                tween(cursor, { Size = UDim2.fromOffset(sz + 4, sz + 4) }, TweenInfo.new(0.08))
+                apply(kind, i.Position)
+            end)
+        end
+        draggable("sv", sv)
+        draggable("hue", hue)
+        if alphaBar then draggable("alpha", alphaBar) end
         w:_connect(UserInputService.InputChanged, function(i)
-            if svDrag and isMove(i) then local s, v = svFromInput(i); update(Color3.fromHSV(hsvH, s, v)) end
+            if not dragKind then return end
+            local isMouse = dragInput.UserInputType == Enum.UserInputType.MouseButton1
+            if (isMouse and i.UserInputType == Enum.UserInputType.MouseMovement) or (not isMouse and i == dragInput) then
+                apply(dragKind, i.Position)
+            end
         end)
         w:_connect(UserInputService.InputEnded, function(i)
-            if isPress(i) then if svDrag then push() end; svDrag = false end
+            if dragKind and (i == dragInput or i.UserInputType == Enum.UserInputType.MouseButton1) then
+                local cursor = dragKind == "sv" and svCursor or (dragKind == "hue" and hueCursor or alphaCursor)
+                local base = dragKind == "sv" and (touch and 18 or 14) or (barH + 6)
+                tween(cursor, { Size = UDim2.fromOffset(base, base) }, TI_POP)
+                dragKind, dragInput = nil, nil
+                tab.Page.ScrollingEnabled = true
+                commit()
+            end
         end)
 
-        -- hue bar dragging
-        local hueDrag = false
-        local function hueFromInput(i)
-            return math.clamp((i.Position.X - hueHit.AbsolutePosition.X) / math.max(hueHit.AbsoluteSize.X, 1), 0, 1)
-        end
-        hueHit.InputBegan:Connect(function(i)
-            if isPress(i) then hueDrag = true; update(Color3.fromHSV(hueFromInput(i), hsvS, hsvV)) end
-        end)
-        w:_connect(UserInputService.InputChanged, function(i)
-            if hueDrag and isMove(i) then update(Color3.fromHSV(hueFromInput(i), hsvS, hsvV)) end
-        end)
-        w:_connect(UserInputService.InputEnded, function(i)
-            if isPress(i) then if hueDrag then push() end; hueDrag = false end
-        end)
-
+        -- typed input
         hexBox.FocusLost:Connect(function()
-            local ok, c = pcall(hexToColor3, hexBox.Text)
-            if ok and c then update(c); push() end
+            local hex = hexBox.Text:gsub("[^%x]", "")
+            if #hex == 3 then hex = hex:sub(1, 1):rep(2) .. hex:sub(2, 2):rep(2) .. hex:sub(3, 3):rep(2) end
+            if #hex == 6 then
+                local nh, ns, nv = Color3.toHSV(hexToColor3(hex))
+                setHSV(nh, ns, nv)
+                commit()
+            else
+                refresh()
+            end
         end)
+        for ch, b in pairs(chans) do
+            b.FocusLost:Connect(function()
+                local n = tonumber(b.Text)
+                if n then
+                    n = math.clamp(math.floor(n + 0.5), 0, 255) / 255
+                    local c = Color3.new(ch == "R" and n or color.R, ch == "G" and n or color.G, ch == "B" and n or color.B)
+                    local nh, ns, nv = Color3.toHSV(c)
+                    setHSV(nh, ns, nv)
+                    commit()
+                else
+                    refresh()
+                end
+            end)
+        end
 
-        swatch.MouseButton1Click:Connect(function()
-            picker.Visible = not picker.Visible
-        end)
+        local function setOpen(open)
+            if open and w._openPicker and w._openPicker ~= obj then pcall(w._openPicker.Close) end
+            panel.Visible = open
+            w._openPicker = open and obj or (w._openPicker ~= obj and w._openPicker or nil)
+            tween(swStroke, { Transparency = open and 0 or 0.1 })
+            swStroke.Color = open and w.Theme.Accent or w.Theme.Stroke
+            if open then rebuildRecent() end
+        end
+        obj.Close = function() setOpen(false) end
+        swatch.Activated:Connect(function() setOpen(not panel.Visible) end)
 
-        update(current)
-        return self:_registerState(cfg, {
-            Get = function() return current end,
-            Set = function(_, c, silent) update(c); if not silent then push() end end,
-        })
+        refresh()
+        function obj:Get() return color end
+        function obj:GetTransparency() return alpha end
+        function obj:Set(c, silent)
+            if typeof(c) ~= "Color3" then return end
+            local nh, ns, nv = Color3.toHSV(c)
+            setHSV(nh, ns, nv)
+            committed = Color3.fromHSV(h, s, v)
+            refresh()
+            if not silent then safe(cfg.Callback, color, alpha) end
+        end
+        function obj:SetTransparency(t, silent)
+            alpha = math.clamp(tonumber(t) or 0, 0, 1)
+            refresh()
+            if not silent then safe(cfg.Callback, color, alpha) end
+        end
+        function obj:Open() setOpen(true) end
+        function obj:_serialize()
+            return { __prismType = "Color3", r = color.R, g = color.G, b = color.B, a = alpha }
+        end
+        function obj:_deserialize(val)
+            if type(val) == "table" and type(val.r) == "number" then
+                if type(val.a) == "number" then alpha = math.clamp(val.a, 0, 1) end
+                return Color3.new(val.r, val.g, val.b)
+            end
+            return color
+        end
+        return self:_registerState(cfg, obj)
     end
 
     function Tab:AddProgressBar(cfg)
@@ -3799,6 +3978,153 @@ local Prism = (function()
         end)
     end
 
+    ------------------------------------------------------------------ standalone key system (Junkie-compatible API)
+    Library.KeyProviders = Library.KeyProviders or {}
+
+    function Library:RegisterKeyProvider(id, spec) Library.KeyProviders[id] = spec end
+    function Library:RegisterHttpProvider(id, spec) Library.KeyProviders[id] = spec end
+    function Library:RegisterCustomProvider(id, name, verifyFn, copyFn)
+        Library.KeyProviders[id] = { Name = name or id, Icon = "key-round", Args = { "Key" }, Verify = verifyFn, Copy = copyFn }
+    end
+
+    local function resolveProvider(idOrSpec)
+        local spec = idOrSpec
+        if type(idOrSpec) == "string" then spec = Library.KeyProviders[idOrSpec] end
+        if type(spec) ~= "table" then return nil end
+        if type(spec.New) == "function" then
+            local ok, inst = pcall(spec.New)
+            if ok and type(inst) == "table" then
+                return { Name = spec.Name or tostring(idOrSpec), Verify = inst.Verify, Copy = inst.Copy }
+            end
+            return nil
+        end
+        if type(spec.Verify) == "function" then
+            return { Name = spec.Name or tostring(idOrSpec), Verify = spec.Verify, Copy = spec.Copy }
+        end
+        return nil
+    end
+
+    local function setScriptKey(k)
+        pcall(function() if type(getgenv) == "function" then getgenv().SCRIPT_KEY = k end end)
+    end
+
+    -- cfg: Title, Subtitle, Note, Identifier, Provider, Service, SaveKey, KeyProvider,
+    --      Verify(key) -> ok, msg[, scriptKey], Copy() -> link, OnVerified(key), OnInvalid(msg),
+    --      Theme, Accent, Blur, BlurSize, Mobile, Parent
+    function Library:CreateKeySystem(cfg)
+        cfg = cfg or {}
+        local identifier = cfg.Identifier or "1104813"
+        local service    = cfg.Service or "Key System"
+        local folder     = "PrismKeySystem"
+        local custom     = resolveProvider(cfg.KeyProvider)
+            or (type(cfg.Provider) == "table" and resolveProvider(cfg.Provider))
+            or (type(cfg.Provider) == "string" and Library.KeyProviders[cfg.Provider] and resolveProvider(cfg.Provider))
+            or nil
+        local providerName = type(cfg.Provider) == "string" and cfg.Provider or (custom and custom.Name) or "KEY!"
+
+        -- Junkie SDK (loaded on first use)
+        local Junkie
+        local function ensureJunkie()
+            if Junkie then return Junkie end
+            local ok, sdk = pcall(function()
+                return loadstring(game:HttpGet("https://jnkie.com/sdk/library.lua"))()
+            end)
+            if ok and type(sdk) == "table" then
+                sdk.service    = service
+                sdk.identifier = identifier
+                sdk.provider   = providerName
+                Junkie = sdk
+            end
+            return Junkie
+        end
+        local function junkieVerify(key)
+            local sdk = ensureJunkie()
+            if not sdk or type(sdk.check_key) ~= "function" then
+                -- fail closed: no service, no access
+                return false, "Couldn't reach the key service. Check your connection and try again."
+            end
+            local ok, result = pcall(function() return sdk.check_key(key) end)
+            if not ok then return false, "Key check failed: " .. tostring(result) end
+            if type(result) ~= "table" then return false, "The key service gave an unexpected reply." end
+            if result.valid then
+                if result.message == "KEYLESS" then return true, "Keyless mode", "KEYLESS" end
+                return true, result.message or "Key valid"
+            end
+            return false, result.message or "Invalid key"
+        end
+        local function junkieCopy()
+            local sdk = ensureJunkie()
+            if sdk and type(sdk.get_key_link) == "function" then
+                local ok, l = pcall(function() return sdk.get_key_link() end)
+                if ok and type(l) == "string" then return l end
+            end
+            return ""
+        end
+
+        local verifyFn = cfg.Verify or (custom and custom.Verify) or junkieVerify
+        local copyFn   = cfg.Copy or (custom and custom.Copy) or junkieCopy
+        local verifiedKey = nil
+
+        local ks
+        ks = {
+            Standalone = true,
+            Title = cfg.Title or "Key System",
+            Subtitle = cfg.Subtitle or service,
+            Note = cfg.Note or "Enter your key to continue.",
+            Placeholder = cfg.Placeholder or "Paste your key here...",
+            Footer = cfg.ShowInfo ~= false and ("Provider: %s  ·  Service: %s"):format(tostring(providerName), tostring(service)) or nil,
+            SaveKey = cfg.SaveKey == true,
+            Folder = folder,
+            Path = folder .. "/" .. (tostring(identifier):gsub("[^%w_-]", "_")) .. ".key",
+            Copy = copyFn,
+            Validate = function(key)
+                local ok, valid, msg, scriptKey = pcall(verifyFn, key)
+                if not ok then return false, tostring(valid) end
+                if valid == true then
+                    setScriptKey(scriptKey or key)
+                    return true, msg or "Key valid"
+                end
+                return false, msg or "Invalid key"
+            end,
+            OnInvalid = cfg.OnInvalid,
+            OnSuccess = function(key)
+                verifiedKey = key
+                safe(cfg.OnVerified, key)
+            end,
+        }
+
+        local window = self:CreateWindow({
+            Title = ks.Title, Theme = cfg.Theme, Accent = cfg.Accent, Font = cfg.Font,
+            Blur = cfg.Blur, BlurSize = cfg.BlurSize, Mobile = cfg.Mobile, Parent = cfg.Parent,
+            MobileButton = false, Profile = false, Size = Vector2.new(400, 300),
+            KeySystem = ks,
+        })
+
+        local controller = { Window = window }
+        local function arg(a, b) if a == controller then return b end return a end
+        controller.Verify = function(a, b)
+            local key = tostring(arg(a, b) or "")
+            local ok, msg = window:_checkKey(ks, key)
+            if ok then
+                window:_unlock(ks, (key:match("^%s*(.-)%s*$")))
+            else
+                safe(cfg.OnInvalid, msg)
+                if window._gate then window._gate.say(msg, "error") end
+            end
+            return ok
+        end
+        controller.Copy = function() return copyFn() end
+        controller.IsVerified = function() return verifiedKey ~= nil end
+        controller.Reset = function()
+            if type(delfile) == "function" then pcall(delfile, ks.Path) end
+            verifiedKey = nil
+            setScriptKey(nil)
+        end
+        -- the prompt stays on screen until a key is accepted
+        controller.Prompt = function() return window._gate ~= nil end
+        return controller
+    end
+
     function Library:CreateWindow(cfg)
         cfg = cfg or {}
         local self = setmetatable({ Tabs = {}, _painters = {}, _corners = {}, _conns = {}, _notifId = 0, _stateWidgets = {}, _textRegs = {}, _densityRegs = {}, _searchIndex = {}, _patterns = {}, _groupLabels = {}, _binds = {}, _themeListeners = {} }, Window)
@@ -4149,14 +4475,13 @@ local Prism = (function()
         end
         top.InputBegan:Connect(function(i)
             if i.UserInputType ~= Enum.UserInputType.Touch then return end
-            -- touch positions exclude the top-bar inset; the gui ignores it
-            local p = Vector2.new(i.Position.X, i.Position.Y) + GuiService:GetGuiInset()
+            local p = Vector2.new(i.Position.X, i.Position.Y)
             if inRect(closeBtn, p) or inRect(minBtn, p) then return end
             beginDrag(i)
         end)
         self:_connect(UserInputService.InputBegan, function(i)
             if i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
-            local m = UserInputService:GetMouseLocation()
+            local m = Vector2.new(i.Position.X, i.Position.Y)
             if not inRect(holder, m) then return end
             if overInteractive(m.X, m.Y) then return end
             beginDrag(i)
