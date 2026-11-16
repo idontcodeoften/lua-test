@@ -1,5 +1,5 @@
 --[[
-    PrismUI v1.6 - executor single-file build
+    PrismUI v1.7 - executor single-file build
     Load from a hosted raw file:
     local Prism = loadstring(game:HttpGet("RAW_GITHUB_URL"))()
     local Window = Prism:CreateWindow({
@@ -7,6 +7,9 @@
         Subtitle = "auto",            -- or a custom string; "auto" shows @player
         Font = "BuilderSans",         -- BuilderSans | Gotham | Montserrat | Code
         Mobile = nil,                 -- nil = auto-detect touch, true/false to force
+        MobileScale = 0.85,           -- UI scale used on phones when Scale isn't set
+        Icon = nil,                   -- optional top-bar icon (asset id or icon name)
+        PinButton = true,             -- false hides the pin button
         MobileButton = nil,           -- floating open/close bubble (default: on for touch)
         TextScale = 1,                -- 0.8 - 1.3
         Scale = nil,                  -- UI scale 0.5 - 1.5 (default: auto-fit to the screen)
@@ -19,6 +22,20 @@
         Rainbow = false,              -- slow hue-cycling accent
         Profile = true,               -- player card at the bottom of the sidebar
     })
+
+    What's new in v1.7
+      * Minimize turns the window into a pill-shaped bar at the top-centre of the screen.
+        Drag it anywhere; tap/click it (without dragging) to restore. The pin is hidden there.
+      * The window now drags from the top bar only, so sliders, pickers and other controls
+        never move the window.
+      * New top bar: optional icon (cfg.Icon), title with tags, subtitle underneath, and the
+        pin / minimize / close buttons grouped in a pill. Window:SetTitle(t) / :SetSubtitle(t).
+        cfg.PinButton = false removes the pin button entirely.
+      * Tooltips: themed, follow the mouse after a short delay, stay on screen; on touch,
+        press and hold a card to see its tooltip (the hold doesn't trigger the card).
+        Built-in tooltips on the top bar, widgets, sliders, keybinds and colour pickers.
+      * Phones get a smaller UI automatically (cfg.MobileScale, default 0.85; cfg.Scale
+        overrides). The window still fits the screen at any scale.
 
     What's new in v1.6
       * Prism:CreateKeySystem({ Title, Subtitle, Note, Identifier, Provider, Service, SaveKey,
@@ -351,6 +368,10 @@ local Prism = (function()
     end
 
     function Window:_applyCorner(e)
+        if self._minimized and (e.corner == self._mainCorner or e.corner == self._bgCorner) then
+            e.corner.CornerRadius = UDim.new(1, 0)
+            return
+        end
         local r = self.CornerRadius
         if e.scale == "pill" then
             e.corner.CornerRadius = r <= 0 and UDim.new(0, 0) or UDim.new(1, 0)
@@ -394,28 +415,102 @@ local Prism = (function()
     function Window:_font(weight) return (FONT_MAP[self._fontName] or FONT_MAP.Gotham)[weight or "Normal"] end
 
     -- Hover tooltip.
+    -- Themed tooltip. Mouse: hover for a moment, follows the cursor. Touch: press and hold.
     function Window:_tooltip(inst, text)
-        if not text or text == "" or self._touch then return end
-        local tip
-        local function kill() if tip then tip:Destroy(); tip = nil end end
-        inst.MouseEnter:Connect(function()
+        if not text or text == "" then return end
+        local tip, token = nil, 0
+        local function kill()
+            token += 1
+            if tip then
+                local t = tip
+                tip = nil
+                tween(t, { BackgroundTransparency = 1, TextTransparency = 1 }, TweenInfo.new(0.1))
+                local st = t:FindFirstChildOfClass("UIStroke")
+                if st then tween(st, { Transparency = 1 }, TweenInfo.new(0.1)) end
+                task.delay(0.12, function() t:Destroy() end)
+            end
+        end
+        -- pos is in screen pixels (top bar included), which is this gui's offset space
+        local function place(pos, above)
+            if not tip then return end
+            local vp = self.Gui.AbsoluteSize
+            local ts = tip.AbsoluteSize
+            local x = math.clamp(pos.X + (above and -ts.X / 2 or 14), 6, math.max(6, vp.X - ts.X - 6))
+            local y = math.clamp(pos.Y - (above and 28 or 10), ts.Y + 6, math.max(ts.Y + 6, vp.Y - 6))
+            tip.Position = UDim2.fromOffset(x, y)
+        end
+        local function show(pos, above)
             kill()
-            local m = UserInputService:GetMouseLocation()
             tip = New("TextLabel", {
                 Parent = self.Gui, Text = text, Font = self:_font("Medium"), TextSize = self:_ts(12),
-                TextColor3 = Color3.new(1, 1, 1), BackgroundColor3 = rgb(20, 20, 26), BackgroundTransparency = 0.08,
-                AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromOffset(m.X + 14, m.Y - 10),
-                AutomaticSize = Enum.AutomaticSize.XY, Size = UDim2.fromOffset(0, 0), ZIndex = 100,
-                BorderSizePixel = 0, TextWrapped = true,
+                AnchorPoint = Vector2.new(0, 1), AutomaticSize = Enum.AutomaticSize.XY, Size = UDim2.fromOffset(0, 0),
+                ZIndex = 200, BorderSizePixel = 0, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+                BackgroundColor3 = self.Theme.Elevated, TextColor3 = self.Theme.Text,
+                BackgroundTransparency = 1, TextTransparency = 1,
             })
-            self:_corner(tip, 0.4)
-            pad(tip, 6, 9)
-            local st = New("UIStroke", { Parent = tip, Thickness = 1 })
-            st.Color = self.Theme.Stroke
-            tip.Destroying:Connect(kill)
+            New("UISizeConstraint", { Parent = tip, MaxSize = Vector2.new(240, math.huge) })
+            New("UICorner", { Parent = tip, CornerRadius = UDim.new(0, 8) })
+            New("UIStroke", { Parent = tip, Thickness = 1, Color = self.Theme.Stroke, Transparency = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
+            pad(tip, 6, 10)
+            place(pos, above)
+            task.defer(function() place(pos, above) end) -- once its size is known
+            tween(tip, { BackgroundTransparency = 0.02, TextTransparency = 0 }, TweenInfo.new(0.12))
+            tween(tip:FindFirstChildOfClass("UIStroke"), { Transparency = 0.2 }, TweenInfo.new(0.12))
+        end
+
+        -- mouse
+        inst.MouseEnter:Connect(function()
+            if self._touch then return end
+            kill()
+            local my = token
+            task.delay(0.35, function()
+                if my == token and inst.Parent and inst.Visible ~= false then
+                    show(UserInputService:GetMouseLocation())
+                    token = my
+                end
+            end)
+        end)
+        inst.MouseMoved:Connect(function()
+            if tip and not self._touch then place(UserInputService:GetMouseLocation()) end
         end)
         inst.MouseLeave:Connect(kill)
         inst.Destroying:Connect(kill)
+
+        -- touch: press and hold
+        local pressInput, pressPos = nil, nil
+        inst.InputBegan:Connect(function(i)
+            if i.UserInputType ~= Enum.UserInputType.Touch then return end
+            pressInput = i
+            -- input positions exclude the top bar; this gui's offsets include it
+            pressPos = Vector2.new(i.Position.X, i.Position.Y) + GuiService:GetGuiInset()
+            local start = Vector2.new(i.Position.X, i.Position.Y)
+            local my = token
+            task.delay(0.45, function()
+                if my ~= token or pressInput ~= i or not inst.Parent then return end
+                local now = Vector2.new(i.Position.X, i.Position.Y)
+                if (now - start).Magnitude > 12 then return end -- it was a scroll
+                self._lp[inst] = os.clock()
+                show(pressPos, true)
+                token = my
+            end)
+        end)
+        inst.InputEnded:Connect(function(i)
+            if i ~= pressInput then return end
+            pressInput = nil
+            if tip then
+                local my = token
+                task.delay(1.4, function() if my == token then kill() end end)
+            else
+                token += 1
+            end
+        end)
+    end
+
+    -- true (once) if this card was just long-pressed to show a tooltip, so the press shouldn't count
+    function Window:_consumeLongPress(inst)
+        local t = self._lp and self._lp[inst]
+        if t and os.clock() - t < 2 then self._lp[inst] = nil; return true end
+        return false
     end
 
     function Window:_connect(signal, fn) table.insert(self._conns, signal:Connect(fn)) end
@@ -444,8 +539,14 @@ local Prism = (function()
 
     function Window:SetScale(scale)
         self._userScale = math.clamp(tonumber(scale) or 1, 0.5, 1.5)
-        if self._scale and self.Holder.Visible then tween(self._scale, { Scale = self._userScale }, TI) end
+        if self._fitSize then
+            self._size = self._fitSize()
+            if not self._minimized and self.Holder then self.Holder.Size = UDim2.fromOffset(self._size.X, self._size.Y) end
+            self:_layout()
+        end
+        if self._scale and self._open then tween(self._scale, { Scale = self._userScale }, TI) end
     end
+    function Window:GetScale() return self._userScale end
 
     function Window:SetDensity(mode)
         self.Density = mode == "compact" and "compact" or "comfortable"
@@ -666,27 +767,51 @@ local Prism = (function()
 
     function Window:SetMinimized(state)
         if state == nil then state = not self._minimized end
+        state = state == true
         if state and self._pinned then self:_pinNudge() return end
+        if state == (self._minimized == true) then return end
         self._minimized = state
         task.defer(function() self:_syncBlur() end)
         self._minIcon.Image = resolveIcon(state and "maximize-2" or "minimize-2")
+        self._minimizeToken = (self._minimizeToken or 0) + 1
+        local H = self._headerH
         if state then
-            self._minimizeToken = (self._minimizeToken or 0) + 1
-            local token = self._minimizeToken
+            -- shrink into a pill-shaped bar at the top-centre of the screen
             self._preMinimizePos = self.Holder.Position
-            tween(self.Holder, { Size = UDim2.fromOffset(math.min(300, self._size.X), self._headerH + 2) }, TI_POP)
-            task.delay(0.28, function()
-                if token == self._minimizeToken and self._minimized then
-                    self._body.Visible = false
-                end
-            end)
+            local cam = workspace.CurrentCamera
+            local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+            local inset = GuiService:GetGuiInset()
+            local sc = self._userScale or 1
+            local pillW = math.min(self._touch and 300 or 340, (vp.X - 24) / sc)
+            local y = math.max(inset.Y / 2, H * sc / 2 + 6)
+            self._body.Visible = false
+            self._headerLine.Visible = false
+            if self._pinBtn then self._pinBtn.Visible = false end
+            if self._subLabel then self._subLabel.Visible = false end
+            self:_headerRelayout()
+            self:SetCornerRadius(self.CornerRadius)
+            tween(self.Holder, { Size = UDim2.fromOffset(pillW, H), Position = UDim2.new(0.5, 0, 0, y) }, TI_POP)
         else
-            self._minimizeToken = (self._minimizeToken or 0) + 1
             self._body.Visible = true
-            tween(self.Holder, { Size = UDim2.fromOffset(self._size.X, self._size.Y) }, TI_POP)
-            -- re-center the expanded window so it is always fully on screen
-            tween(self.Holder, { Position = UDim2.fromScale(0.5, 0.5) }, TI_POP)
+            self._headerLine.Visible = true
+            if self._pinBtn then self._pinBtn.Visible = self._pinAllowed end
+            if self._subLabel then self._subLabel.Visible = true end
+            self:_headerRelayout()
+            self:SetCornerRadius(self.CornerRadius)
+            tween(self.Holder, {
+                Size = UDim2.fromOffset(self._size.X, self._size.Y),
+                Position = self._preMinimizePos or UDim2.fromScale(0.5, 0.5),
+            }, TI_POP)
         end
+    end
+
+    function Window:IsMinimized() return self._minimized == true end
+
+    function Window:SetTitle(text)
+        if self._titleLabel then self._titleLabel.Text = tostring(text) end
+    end
+    function Window:SetSubtitle(text)
+        if self._subLabel then self._subLabel.Text = tostring(text or "") end
     end
 
     function Window:SetToggleKey(key) self.ToggleKey = key end
@@ -1054,6 +1179,8 @@ local Prism = (function()
             AutoButtonColor = false, BackgroundTransparency = 1,
         })
         self:_bind(collapseBtn, "TextColor3", "SubText")
+        self:_tooltip(lockBtn, "Lock position")
+        self:_tooltip(collapseBtn, "Collapse")
 
         local body = New("Frame", { Parent = frame, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2 })
         New("UIListLayout", { Parent = body, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder })
@@ -2163,7 +2290,7 @@ local Prism = (function()
         end
         local isDisabled = self:_disabler(card)
         card.MouseButton1Click:Connect(function()
-            if isDisabled() then return end
+            if isDisabled() or w:_consumeLongPress(card) then return end
             if chev then
                 tween(chev, { Position = UDim2.new(1, 4, 0.5, 0) }, TweenInfo.new(0.08))
                 task.delay(0.1, function() tween(chev, { Position = UDim2.new(1, 0, 0.5, 0) }) end)
@@ -2250,7 +2377,7 @@ local Prism = (function()
         end
 
         card.MouseButton1Click:Connect(function()
-            if isDisabled() then return end
+            if isDisabled() or w:_consumeLongPress(card) then return end
             -- thumb stretch while pressed
             tween(thumb, { Size = UDim2.fromOffset(tk + 4, tk - 2) }, TweenInfo.new(0.07))
             task.delay(0.09, function() tween(thumb, { Size = UDim2.fromOffset(tk, tk) }) end)
@@ -2309,6 +2436,7 @@ local Prism = (function()
                 tween(knob, { Size = UDim2.fromOffset(ks, ks) }, TI)
             end
         end)
+        w:_tooltip(valueLabel, "Click to type an exact value")
         valueLabel.FocusLost:Connect(function()
             local n = tonumber(valueLabel.Text:match("-?%d+%.?%d*"))
             set(n or obj.Value)
@@ -2544,6 +2672,7 @@ local Prism = (function()
         w:_styleLabel(btn, "Medium", 12)
         w:_corner(btn, 0.5)
         local st = w:_stroke(btn, "Accent"); st.Transparency = 1
+        if not touch then w:_tooltip(btn, "Click, then press a key or mouse button. Backspace clears, Esc cancels.") end
         local function paint()
             local th = w.Theme
             if touch then
@@ -2651,6 +2780,7 @@ local Prism = (function()
         local swFill = New("Frame", { Parent = swatch, Size = UDim2.fromScale(1, 1), BorderSizePixel = 0 })
         w:_corner(swFill, 0.6)
         w:_bind(swatch, "BackgroundColor3", "Elevated")
+        w:_tooltip(swatch, "Edit colour")
 
         local panel = New("Frame", { Parent = card, Visible = false, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2 })
         pad(panel, 4, 0, 2, 0)
@@ -4127,7 +4257,7 @@ local Prism = (function()
 
     function Library:CreateWindow(cfg)
         cfg = cfg or {}
-        local self = setmetatable({ Tabs = {}, _painters = {}, _corners = {}, _conns = {}, _notifId = 0, _stateWidgets = {}, _textRegs = {}, _densityRegs = {}, _searchIndex = {}, _patterns = {}, _groupLabels = {}, _binds = {}, _themeListeners = {} }, Window)
+        local self = setmetatable({ Tabs = {}, _painters = {}, _corners = {}, _conns = {}, _notifId = 0, _stateWidgets = {}, _textRegs = {}, _densityRegs = {}, _searchIndex = {}, _patterns = {}, _groupLabels = {}, _binds = {}, _themeListeners = {}, _lp = setmetatable({}, { __mode = "k" }) }, Window)
         self._themeName = cfg.Theme or "Midnight"
         self._accent    = cfg.Accent
         self._baseAccent = cfg.Accent
@@ -4163,16 +4293,23 @@ local Prism = (function()
         self._baseSize = size
         local cam0 = workspace.CurrentCamera
         local inset0 = GuiService:GetGuiInset()
+        if cfg.Scale ~= nil then
+            self._userScale = math.clamp(tonumber(cfg.Scale) or 1, 0.5, 1.5)
+        elseif self._touch then
+            self._userScale = math.clamp(tonumber(cfg.MobileScale) or 0.85, 0.5, 1.5)
+        else
+            self._userScale = 1
+        end
         local function fitSize()
             local vp = cam0 and cam0.ViewportSize or Vector2.new(1280, 720)
-            local ax, ay = vp.X - 20, vp.Y - inset0.Y - 20
+            local sc = self._userScale or 1
+            local ax, ay = (vp.X - 20) / sc, (vp.Y - inset0.Y - 20) / sc
             local b = self._baseSize
             return Vector2.new(math.max(math.min(b.X, ax), 300), math.max(math.min(b.Y, ay), 220))
         end
         self._fitSize = fitSize
         size = fitSize()
         self._size = size
-        self._userScale = math.clamp(tonumber(cfg.Scale) or 1, 0.5, 1.5)
 
         local holder = New("Frame", { Name = "Window", Parent = gui, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, inset0.Y / 2), Size = UDim2.fromOffset(size.X, size.Y), BackgroundTransparency = 1 })
         local scale  = New("UIScale", { Parent = holder, Scale = 0.92 * self._userScale })
@@ -4205,7 +4342,7 @@ local Prism = (function()
         local main = New("Frame", { Name = "Main", Parent = holder, Size = UDim2.fromScale(1, 1), BorderSizePixel = 0, ClipsDescendants = true })
         self:_bind(main, "BackgroundColor3", "Background")
         self:_glassify(main, 0.55)
-        self:_corner(main, 1)
+        self._mainCorner = self:_corner(main, 1)
         local borderStroke = self:_stroke(main, "Stroke")
         self._borderStroke = borderStroke
         borderStroke.Enabled = self._borderOn
@@ -4214,43 +4351,54 @@ local Prism = (function()
             Name = "BackgroundImage", Parent = main, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
             ScaleType = Enum.ScaleType.Crop, ZIndex = 0, Visible = false,
         })
-        self:_corner(bgImage, 1)
+        self._bgCorner = self:_corner(bgImage, 1)
         self._bgImageLabel = bgImage
         self:SetBackgroundImage(nil, nil)
 
-        -- header: brand dot, title, subtitle and tags on one line; plain icon buttons on the right
-        local HEADER_H = self._touch and 52 or 46
+        -- top bar: optional icon, title + tags, subtitle underneath, grouped controls on the right
+        local HEADER_H = self._touch and 54 or 50
         self._headerH = HEADER_H
         local top = New("Frame", { Name = "Header", Parent = main, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, HEADER_H) })
         self._header = top
+        -- invisible surface the window is dragged by (labels let input through to it)
+        local dragSurface = New("TextButton", { Name = "DragSurface", Parent = top, BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Size = UDim2.fromScale(1, 1), ZIndex = 0 })
         local headerLine = New("Frame", { Parent = main, Position = UDim2.fromOffset(0, HEADER_H), Size = UDim2.new(1, 0, 0, 1), BorderSizePixel = 0 })
         self:_bind(headerLine, "BackgroundColor3", "Stroke")
+        self._headerLine = headerLine
 
-        local BTN = self._touch and 36 or 28
-        local titleRow = New("Frame", {
-            Parent = top, BackgroundTransparency = 1, Position = UDim2.fromOffset(16, 0),
-            Size = UDim2.new(1, -(BTN * 3 + 50), 1, 0), ClipsDescendants = true,
+        local BTN = self._touch and 34 or 28
+        local leftX = 16
+        local iconImg = cfg.Icon and resolveIcon(cfg.Icon) or nil
+        if iconImg then
+            local iconBox = New("Frame", { Parent = top, AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0), Size = UDim2.fromOffset(30, 30), BorderSizePixel = 0 })
+            self:_corner(iconBox, 0.75)
+            self:_bind(iconBox, "BackgroundColor3", "Elevated")
+            local ic = New("ImageLabel", { Parent = iconBox, BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(16, 16), Image = iconImg })
+            self:_bind(ic, "ImageColor3", "Accent")
+            leftX = 52
+        end
+
+        local subText = nil
+        if cfg.Subtitle then
+            subText = cfg.Subtitle == "auto" and ("@" .. tostring(Players.LocalPlayer and Players.LocalPlayer.Name or "player")) or tostring(cfg.Subtitle)
+        end
+        local titleBlock = New("Frame", { Parent = top, BackgroundTransparency = 1, Position = UDim2.fromOffset(leftX, 0), Size = UDim2.new(1, -(leftX + 140), 1, 0), ClipsDescendants = true })
+        local line1 = New("Frame", {
+            Parent = titleBlock, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 20),
+            AnchorPoint = Vector2.new(0, subText and 1 or 0.5), Position = UDim2.new(0, 0, 0.5, subText and 1 or 0),
         })
         New("UIListLayout", {
-            Parent = titleRow, FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center,
-            Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder,
+            Parent = line1, FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center,
+            Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder,
         })
         local brandTitle = New("TextLabel", {
-            Parent = titleRow, BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 20),
+            Parent = line1, BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 20),
             Text = cfg.Title or "PrismUI", Font = self:_font("Bold"), TextSize = self:_ts(15),
             TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 1,
         })
         self:_styleLabel(brandTitle, "Bold", 15)
         self:_bind(brandTitle, "TextColor3", "Text")
-        if cfg.Subtitle then
-            local subText = cfg.Subtitle == "auto" and ("@" .. tostring(Players.LocalPlayer and Players.LocalPlayer.Name or "player")) or tostring(cfg.Subtitle)
-            local sub = New("TextLabel", {
-                Parent = titleRow, BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 20),
-                Text = subText, Font = self:_font("Medium"), TextSize = self:_ts(12), TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 2,
-            })
-            self:_styleLabel(sub, "Medium", 12)
-            self:_bind(sub, "TextColor3", "SubText")
-        end
+        self._titleLabel = brandTitle
         for index, tag in ipairs(cfg.Tags or {}) do
             local text, color
             if type(tag) == "table" then
@@ -4261,8 +4409,8 @@ local Prism = (function()
             end
             if text ~= "" then
                 local pill = New("TextLabel", {
-                    Parent = titleRow, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 18), BorderSizePixel = 0,
-                    Text = string.upper(text), Font = self:_font("Bold"), TextSize = self:_ts(9), LayoutOrder = 2 + index,
+                    Parent = line1, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 17), BorderSizePixel = 0,
+                    Text = string.upper(text), Font = self:_font("Bold"), TextSize = self:_ts(9), LayoutOrder = 1 + index,
                 })
                 self:_styleLabel(pill, "Bold", 9)
                 self:_corner(pill, "pill")
@@ -4276,43 +4424,69 @@ local Prism = (function()
                 end
             end
         end
+        if subText then
+            local sub = New("TextLabel", {
+                Parent = titleBlock, BackgroundTransparency = 1, Position = UDim2.new(0, 0, 0.5, 3), Size = UDim2.new(1, 0, 0, 14),
+                Text = subText, Font = self:_font("Medium"), TextSize = self:_ts(11),
+                TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+            })
+            self:_styleLabel(sub, "Medium", 11)
+            self:_bind(sub, "TextColor3", "SubText")
+            self._subLabel = sub
+        end
 
-        local function topButton(iconName, x, danger)
+        -- controls grouped in a pill
+        local group = New("Frame", {
+            Name = "Controls", Parent = top, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0),
+            Size = UDim2.fromOffset(0, BTN + 6), AutomaticSize = Enum.AutomaticSize.X, BorderSizePixel = 0,
+        })
+        self:_corner(group, "pill")
+        self:_bind(group, "BackgroundColor3", "Surface")
+        local groupStroke = self:_stroke(group, "Stroke"); groupStroke.Transparency = 0.45
+        pad(group, 0, 3, 0, 3)
+        New("UIListLayout", {
+            Parent = group, FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center,
+            Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder,
+        })
+        self._controlGroup = group
+        local function topButton(iconName, order, danger, tip)
             local b = New("TextButton", {
-                Parent = top, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, x, 0.5, 0),
-                Size = UDim2.fromOffset(BTN, BTN), Text = "", AutoButtonColor = false,
-                BackgroundTransparency = 1, BorderSizePixel = 0,
+                Parent = group, Size = UDim2.fromOffset(BTN, BTN), Text = "", AutoButtonColor = false,
+                BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = order,
             })
-            self:_corner(b, 0.6)
-            local image = New("ImageLabel", {
-                Parent = b, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-                Size = UDim2.fromOffset(14, 14), BackgroundTransparency = 1, Image = resolveIcon(iconName),
-            })
-            self:_onTheme(b, function()
-                b.BackgroundColor3 = danger and rgb(220, 70, 84) or self.Theme.Elevated
-                image.ImageColor3 = self.Theme.SubText
-            end)
-            b.MouseEnter:Connect(function()
-                if self._touch then return end
-                tween(b, { BackgroundTransparency = 0 }, TI)
-                tween(image, { ImageColor3 = danger and Color3.new(1, 1, 1) or self.Theme.Text }, TI)
-            end)
-            b.MouseLeave:Connect(function()
-                tween(b, { BackgroundTransparency = 1 }, TI)
-                tween(image, { ImageColor3 = self.Theme.SubText }, TI)
-            end)
+            self:_corner(b, "pill")
+            local image
+            if iconName then
+                image = New("ImageLabel", {
+                    Parent = b, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+                    Size = UDim2.fromOffset(14, 14), BackgroundTransparency = 1, Image = resolveIcon(iconName),
+                })
+                self:_onTheme(b, function()
+                    b.BackgroundColor3 = danger and rgb(220, 70, 84) or self.Theme.Elevated
+                    image.ImageColor3 = self.Theme.SubText
+                end)
+                b.MouseEnter:Connect(function()
+                    if self._touch then return end
+                    tween(b, { BackgroundTransparency = 0 }, TI)
+                    tween(image, { ImageColor3 = danger and Color3.new(1, 1, 1) or self.Theme.Text }, TI)
+                end)
+                b.MouseLeave:Connect(function()
+                    tween(b, { BackgroundTransparency = 1 }, TI)
+                    tween(image, { ImageColor3 = self.Theme.SubText }, TI)
+                end)
+            end
+            local sc = New("UIScale", { Parent = b })
+            b.InputBegan:Connect(function(i) if isPress(i) then tween(sc, { Scale = 0.88 }, TweenInfo.new(0.07)) end end)
+            b.InputEnded:Connect(function(i) if isPress(i) then tween(sc, { Scale = 1 }, TI_POP) end end)
+            self:_tooltip(b, tip)
             return b, image
         end
-        local closeBtn = topButton("x", -10, true)
-        local minBtn, minIcon = topButton("minimize-2", -(14 + BTN))
-        self._minButton, self._minIcon = minBtn, minIcon
+        local willFab = cfg.MobileButton == true or (cfg.MobileButton == nil and self._touch)
 
         -- pin: a pinned window always stays open
-        local pinBtn = New("TextButton", {
-            Parent = top, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -(18 + BTN * 2), 0.5, 0),
-            Size = UDim2.fromOffset(BTN, BTN), Text = "", AutoButtonColor = false, BackgroundTransparency = 1, BorderSizePixel = 0,
-        })
-        self:_corner(pinBtn, 0.6)
+        self._pinAllowed = cfg.PinButton ~= false
+        local pinBtn = topButton(nil, 1, false, "Pin: keep the window open")
+        pinBtn.Visible = self._pinAllowed
         local _, colorPin = drawPin(pinBtn)
         self._pinBtn = pinBtn
         self._pinPaint = function()
@@ -4325,7 +4499,18 @@ local Prism = (function()
         pinBtn.MouseEnter:Connect(function() if not self._touch and not self._pinned then tween(pinBtn, { BackgroundTransparency = 0.4 }) end end)
         pinBtn.MouseLeave:Connect(function() if not self._pinned then tween(pinBtn, { BackgroundTransparency = 1 }) end end)
         pinBtn.Activated:Connect(function() self:SetPinned(not self._pinned) end)
-        self:_tooltip(pinBtn, "Keep the window open")
+
+        local minBtn, minIcon = topButton("minimize-2", 2, false, "Minimize")
+        local closeBtn = topButton("x", 3, true, willFab and "Hide (reopen with the round button)" or "Close")
+        self._minButton, self._minIcon = minBtn, minIcon
+
+        self._headerRelayout = function()
+            local n = 0
+            for _, b in ipairs({ pinBtn, minBtn, closeBtn }) do if b.Visible then n += 1 end end
+            local gw = n * BTN + (n - 1) * 2 + 6
+            titleBlock.Size = UDim2.new(1, -(leftX + gw + 22), 1, 0)
+        end
+        self._headerRelayout()
 
         -- body: sidebar (or a horizontal tab strip on narrow screens) + pages
         local body = New("Frame", { Parent = main, BackgroundTransparency = 1, Position = UDim2.fromOffset(0, HEADER_H + 1), Size = UDim2.new(1, 0, 1, -(HEADER_H + 1)) })
@@ -4455,47 +4640,35 @@ local Prism = (function()
             self:_connect(UserInputService.InputEnded, function(i) if isPress(i) then resize = false end end)
         end
 
-        -- Drag: with a mouse, from any non-interactive part of the window; with
-        -- touch, from the header only so swiping a page scrolls it instead.
-        local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
-        local function overInteractive(x, y)
-            local ok, objs = pcall(function() return gui:GetGuiObjectsAtPosition(x, y) end)
-            if not ok or type(objs) ~= "table" then return false end
-            for _, o in ipairs(objs) do
-                if o:IsA("TextBox") or o:IsA("TextButton") then return true end
-            end
-            return false
-        end
+        -- Drag from the top bar only (mouse + touch), so controls never move the window.
+        -- When minimized, a tap/click on the bar without dragging restores it.
+        local dragging, dragInput, dragStart, startPos, moved = false, nil, nil, nil, false
         local function inRect(g, p)
             local ap, as = g.AbsolutePosition, g.AbsoluteSize
             return p.X >= ap.X and p.X <= ap.X + as.X and p.Y >= ap.Y and p.Y <= ap.Y + as.Y
         end
-        local function beginDrag(i)
-            dragging, dragInput, dragStart, startPos = true, i, Vector2.new(i.Position.X, i.Position.Y), holder.Position
-        end
-        top.InputBegan:Connect(function(i)
-            if i.UserInputType ~= Enum.UserInputType.Touch then return end
+        dragSurface.InputBegan:Connect(function(i)
+            if not isPress(i) then return end
             local p = Vector2.new(i.Position.X, i.Position.Y)
-            if inRect(closeBtn, p) or inRect(minBtn, p) then return end
-            beginDrag(i)
-        end)
-        self:_connect(UserInputService.InputBegan, function(i)
-            if i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
-            local m = Vector2.new(i.Position.X, i.Position.Y)
-            if not inRect(holder, m) then return end
-            if overInteractive(m.X, m.Y) then return end
-            beginDrag(i)
+            if inRect(self._controlGroup, p) then return end
+            dragging, dragInput, dragStart, startPos, moved = true, i, p, holder.Position, false
         end)
         self:_connect(UserInputService.InputChanged, function(i)
             if not dragging then return end
             local isMouse = dragInput.UserInputType == Enum.UserInputType.MouseButton1
             if (isMouse and i.UserInputType == Enum.UserInputType.MouseMovement) or (not isMouse and i == dragInput) then
                 local d = Vector2.new(i.Position.X - dragStart.X, i.Position.Y - dragStart.Y)
-                holder.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+                if d.Magnitude > 6 then moved = true end
+                if moved then
+                    holder.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+                end
             end
         end)
         self:_connect(UserInputService.InputEnded, function(i)
-            if dragging and (i == dragInput or i.UserInputType == Enum.UserInputType.MouseButton1) then dragging = false end
+            if dragging and (i == dragInput or i.UserInputType == Enum.UserInputType.MouseButton1) then
+                dragging = false
+                if not moved and self._minimized then self:SetMinimized(false) end
+            end
         end)
 
         minBtn.MouseButton1Click:Connect(function() self:SetMinimized(not self._minimized) end)
@@ -4527,6 +4700,7 @@ local Prism = (function()
                 Font = self:_font("Bold"), TextSize = 18,
             })
             self:_bind(mark, "TextColor3", "Accent")
+            self:_tooltip(fab, "Open / close")
             local fabInput, fabStart, fabPos, moved = nil, nil, nil, false
             fab.InputBegan:Connect(function(i)
                 if isPress(i) then fabInput, fabStart, fabPos, moved = i, i.Position, fab.Position, false end
