@@ -1,5 +1,5 @@
 --[[
-    PrismUI v1.7 - executor single-file build
+    PrismUI v1.8 - executor single-file build
     Load from a hosted raw file:
     local Prism = loadstring(game:HttpGet("RAW_GITHUB_URL"))()
     local Window = Prism:CreateWindow({
@@ -10,6 +10,9 @@
         MobileScale = 0.85,           -- UI scale used on phones when Scale isn't set
         Icon = nil,                   -- optional top-bar icon (asset id or icon name)
         PinButton = true,             -- false hides the pin button
+        Weather = nil,                -- "snow" | "rain" | "stars" | "sakura"
+        LiquidGlass = false,          -- see-through glass panels with a moving sheen
+        Edges3D = false,              -- bevelled 3D edges
         MobileButton = nil,           -- floating open/close bubble (default: on for touch)
         TextScale = 1,                -- 0.8 - 1.3
         Scale = nil,                  -- UI scale 0.5 - 1.5 (default: auto-fit to the screen)
@@ -22,6 +25,18 @@
         Rainbow = false,              -- slow hue-cycling accent
         Profile = true,               -- player card at the bottom of the sidebar
     })
+
+    What's new in v1.8
+      * Atmosphere: falling snow, rain, twinkling stars or sakura petals behind the window
+        while it (or the key prompt) is open. Fades in/out with the window.
+        cfg.Weather = "snow" | "rain" | "stars" | "sakura", cfg.WeatherDensity = 0.2..2.5,
+        cfg.WeatherColor = Color3 | "accent".  Window:SetWeather(mode, { Density, Color }).
+      * Liquid glass: see-through window and cards over the blurred game, a slowly moving
+        light sheen and glossy rims. cfg.LiquidGlass = true / Window:SetLiquidGlass(on).
+      * 3D edges: bevelled cards, buttons, widgets and window (light top edge, dark bottom
+        edge; toggle tracks and the segmented control look pressed in).
+        cfg.Edges3D = true / Window:SetEdges3D(on).
+      * All three are in the Appearance tab and saved with configs.
 
     What's new in v1.7
       * Minimize turns the window into a pill-shaped bar at the top-centre of the screen.
@@ -368,7 +383,7 @@ local Prism = (function()
     end
 
     function Window:_applyCorner(e)
-        if self._minimized and (e.corner == self._mainCorner or e.corner == self._bgCorner) then
+        if self._minimized and (e.corner == self._mainCorner or e.corner == self._bgCorner or e.corner == self._rimCorner or e.corner == self._sheenCorner) then
             e.corner.CornerRadius = UDim.new(1, 0)
             return
         end
@@ -392,6 +407,39 @@ local Prism = (function()
         local s = New("UIStroke", { Parent = parent, Thickness = thickness or 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
         self:_bind(s, "Color", key or "Stroke")
         return s
+    end
+
+    -- Edge stroke that switches between: 3D bevel, liquid-glass highlight, a flat border, or nothing.
+    -- opts.inset = pressed-in look; opts.flat = { key = "Stroke", t = 0.35 } border when effects are off.
+    local function kp(t, v) return NumberSequenceKeypoint.new(t, v) end
+    function Window:_edge(inst, opts)
+        opts = opts or {}
+        local st = New("UIStroke", { Name = "Edge", Parent = inst, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
+        local g = New("UIGradient", { Parent = st, Rotation = 90 })
+        local WHITE, BLACK = Color3.new(1, 1, 1), Color3.new(0, 0, 0)
+        self:_onTheme(inst, function()
+            if self._bevel then
+                local hi, lo = WHITE, BLACK
+                if opts.inset then hi, lo = BLACK, WHITE end
+                st.Enabled, st.Color, st.Transparency, st.Thickness = true, WHITE, 0, opts.inset and 1 or 1.25
+                g.Enabled = true
+                g.Color = ColorSequence.new({ ColorSequenceKeypoint.new(0, hi), ColorSequenceKeypoint.new(0.5, hi:Lerp(lo, 0.5)), ColorSequenceKeypoint.new(1, lo) })
+                g.Transparency = NumberSequence.new({ kp(0, opts.inset and 0.55 or 0.5), kp(0.5, 0.92), kp(1, opts.inset and 0.75 or 0.55) })
+            elseif self._liquid then
+                st.Enabled, st.Color, st.Transparency, st.Thickness = true, WHITE, 0, 1
+                g.Enabled = true
+                g.Color = ColorSequence.new(WHITE)
+                g.Transparency = NumberSequence.new({ kp(0, opts.inset and 0.9 or 0.5), kp(0.45, 0.86), kp(1, opts.inset and 0.85 or 0.93) })
+            elseif opts.flat then
+                st.Enabled, st.Thickness = true, 1
+                g.Enabled = false
+                st.Color = self.Theme[opts.flat.key or "Stroke"]
+                st.Transparency = opts.flat.t or 0
+            else
+                st.Enabled = false
+            end
+        end)
+        return st
     end
 
     function Window:_text(parent, text, size, font, key)
@@ -763,6 +811,129 @@ local Prism = (function()
             tween(self.Holder, { Size = UDim2.fromOffset(self._size.X, self._size.Y) }, TI_POP)
         end
         self:_layout()
+    end
+
+    ------------------------------------------------------------------ liquid glass / 3D edges
+    function Window:SetLiquidGlass(on)
+        on = on == true
+        if on == (self._liquid == true) then return end
+        self._liquid = on
+        if on then
+            self._glassBeforeLiquid = self._glass
+            self._glass = math.max(self._glass or 0, 0.55)
+            if not self._blurOn then self._blurOn = true; self._liquidBlur = true end
+        else
+            self._glass = self._glassBeforeLiquid or 0
+            if self._liquidBlur then self._blurOn = false; self._liquidBlur = nil end
+        end
+        if self._sheen then self._sheen.Visible = on end
+        self:_refresh()
+        self:_syncBlur()
+    end
+    function Window:SetEdges3D(on)
+        self._bevel = on == true
+        self:_refresh()
+    end
+    Window.SetBevel = Window.SetEdges3D
+
+    ------------------------------------------------------------------ atmosphere (snow / rain / stars / sakura)
+    local WEATHER_COUNT = { snow = 70, rain = 90, stars = 60, sakura = 26 }
+    local WEATHER_TINT = { snow = Color3.new(1, 1, 1), rain = rgb(170, 196, 236), stars = Color3.new(1, 1, 1), sakura = rgb(255, 183, 213) }
+
+    function Window:SetWeather(mode, opts)
+        opts = opts or {}
+        mode = string.lower(tostring(mode or "none"))
+        if not WEATHER_COUNT[mode] then mode = "none" end
+        self._weather = mode
+        if opts.Density ~= nil then self._weatherDensity = math.clamp(tonumber(opts.Density) or 1, 0.2, 2.5) end
+        if opts.Color ~= nil then self._weatherColor = opts.Color end
+        for _, p in ipairs(self._fxParts or {}) do p.f:Destroy() end
+        self._fxParts = {}
+        if not self._fx then
+            self._fx = New("Frame", { Name = "Atmosphere", Parent = self.Gui, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 0, Visible = false })
+            self._fxAlpha = 0
+            self:_onTheme(self._fx, function() self:_paintFx() end)
+            self:_connect(RunService.Heartbeat, function(dt) self:_stepFx(dt) end)
+        end
+        if mode == "none" then self._fx.Visible = false return end
+        local cam = workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+        local n = math.floor(WEATHER_COUNT[mode] * (self._weatherDensity or 1) * (self._touch and 0.6 or 1) + 0.5)
+        for _ = 1, n do
+            local p = { phase = math.random() * 6.283, x = math.random(), y = math.random() }
+            local f = New("Frame", { Parent = self._fx, AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0, BackgroundTransparency = 1 })
+            if mode == "snow" then
+                p.size = math.random(2, 5)
+                p.vy = 0.035 + math.random() * 0.06 + p.size * 0.006
+                p.sway, p.base = 0.004 + math.random() * 0.01, 0.15 + math.random() * 0.4
+                f.Size = UDim2.fromOffset(p.size, p.size)
+                New("UICorner", { Parent = f, CornerRadius = UDim.new(1, 0) })
+            elseif mode == "rain" then
+                local len = math.random(12, 22)
+                p.vy = 0.9 + math.random() * 0.6
+                p.vx = p.vy * 0.12
+                p.base = 0.45 + math.random() * 0.3
+                f.Size = UDim2.fromOffset(1, len)
+                f.Rotation = -math.deg(math.atan2(p.vx * vp.X, p.vy * vp.Y))
+            elseif mode == "stars" then
+                p.size = math.random(1, 3)
+                p.vy, p.tw = -(0.002 + math.random() * 0.006), 0.8 + math.random() * 2
+                p.base = 0.1 + math.random() * 0.3
+                f.Size = UDim2.fromOffset(p.size, p.size)
+                New("UICorner", { Parent = f, CornerRadius = UDim.new(1, 0) })
+            elseif mode == "sakura" then
+                p.size = math.random(6, 10)
+                p.vy, p.vx = 0.045 + math.random() * 0.05, 0.015 + math.random() * 0.03
+                p.sway, p.spin = 0.012, (math.random() - 0.5) * 220
+                p.base = 0.1 + math.random() * 0.25
+                f.Size = UDim2.fromOffset(p.size, math.floor(p.size * 0.65))
+                New("UICorner", { Parent = f, CornerRadius = UDim.new(1, 0) })
+            end
+            p.f = f
+            table.insert(self._fxParts, p)
+        end
+        self:_paintFx()
+    end
+
+    function Window:_paintFx()
+        local mode = self._weather
+        local c = self._weatherColor
+        if c == "accent" then c = self.Theme.Accent elseif typeof(c) ~= "Color3" then c = WEATHER_TINT[mode] end
+        if not c then return end
+        for i, p in ipairs(self._fxParts or {}) do
+            -- a little variety for petals
+            p.f.BackgroundColor3 = (mode == "sakura" and i % 3 == 0) and c:Lerp(Color3.new(1, 1, 1), 0.35) or c
+        end
+    end
+
+    function Window:_stepFx(dt)
+        if not self._fx or self._weather == nil or self._weather == "none" then return end
+        local want = (self._locked and self._gate ~= nil) or (self._open and not self._minimized) or self._weatherAlways
+        local a = self._fxAlpha or 0
+        if want and a < 1 then a = math.min(1, a + dt * 2.5) elseif not want and a > 0 then a = math.max(0, a - dt * 3) end
+        self._fxAlpha = a
+        if a <= 0 then self._fx.Visible = false return end
+        self._fx.Visible = true
+        dt = math.min(dt, 0.1) * math.max(ANIM.speed, 0.15)
+        local t = os.clock()
+        local mode = self._weather
+        for _, p in ipairs(self._fxParts) do
+            local tr = p.base
+            p.y += p.vy * dt
+            if mode == "stars" then
+                if p.y < -0.02 then p.y, p.x = 1.02, math.random() end
+                tr = p.base + (1 - p.base) * 0.65 * (0.5 + 0.5 * math.sin(t * p.tw + p.phase))
+                p.f.Position = UDim2.fromScale(p.x, p.y)
+            else
+                p.x += (p.vx or 0) * dt
+                if p.y > 1.05 then p.y, p.x = -0.05, math.random() * 1.1 - (p.vx and 0.12 or 0) end
+                if p.x > 1.05 then p.x -= 1.1 end
+                local x = p.x + (p.sway and math.sin(t * 1.3 + p.phase) * p.sway or 0)
+                p.f.Position = UDim2.fromScale(x, p.y)
+                if p.spin then p.f.Rotation = (t * p.spin + p.phase * 57) % 360 end
+            end
+            p.f.BackgroundTransparency = 1 - (1 - tr) * a
+        end
     end
 
     function Window:SetMinimized(state)
@@ -1154,7 +1325,7 @@ local Prism = (function()
         self:_bind(frame, "BackgroundColor3", "Surface")
         self:_onTheme(frame, function() frame.BackgroundTransparency = self._widgetT or 0.08 end)
         self:_corner(frame, 0.9)
-        local st = self:_stroke(frame, "Stroke"); st.Transparency = 0.35
+        self:_edge(frame, { flat = { key = "Stroke", t = 0.35 } })
         pad(frame, 10, 12, 12, 12)
         New("UIListLayout", { Parent = frame, Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder })
 
@@ -1974,6 +2145,14 @@ local Prism = (function()
         tab:AddSlider({ ConfigKey = "Animation speed", Title = "Animation speed", Description = "0 turns animations off.", Min = 0, Max = 2, Increment = 0.25, Default = ANIM.speed, Suffix = "x", Callback = function(v) self:SetAnimationSpeed(v) end })
         tab:AddToggle({ ConfigKey = "Window glow", Title = "Accent glow", Default = self._glow == true, Callback = function(on) self:SetGlow(on) end })
         tab:AddToggle({ ConfigKey = "Animated border", Title = "Animated border", Default = self._animBorder == true, Callback = function(on) self:SetAnimatedBorder(on) end })
+        tab:AddToggle({ ConfigKey = "Liquid glass", Title = "Liquid glass", Description = "See-through panels with a moving sheen over the blurred game.", Default = self._liquid == true, Callback = function(on) self:SetLiquidGlass(on) end })
+        tab:AddToggle({ ConfigKey = "3D edges", Title = "3D edges", Description = "Bevelled cards, buttons and window edges.", Default = self._bevel == true, Callback = function(on) self:SetEdges3D(on) end })
+
+        tab:AddSection("Atmosphere")
+        local weatherNames = { none = "None", snow = "Snow", rain = "Rain", stars = "Stars", sakura = "Sakura" }
+        tab:AddDropdown({ ConfigKey = "Weather", Title = "Weather", Description = "Shown behind the window while it's open.", Values = { "None", "Snow", "Rain", "Stars", "Sakura" }, Default = weatherNames[self._weather or "none"] or "None", Callback = function(v) self:SetWeather(string.lower(v)) end })
+        tab:AddSlider({ ConfigKey = "Weather amount", Title = "Amount", Min = 0.2, Max = 2.5, Increment = 0.1, Default = self._weatherDensity or 1, Suffix = "x", Callback = function(v) self:SetWeather(self._weather, { Density = v }) end })
+        tab:AddToggle({ ConfigKey = "Weather accent", Title = "Accent-coloured particles", Default = self._weatherColor == "accent", Callback = function(on) self._weatherColor = on and "accent" or false; self:_paintFx() end })
 
         tab:AddSection("Widgets & notifications")
         tab:AddSlider({ ConfigKey = "Widget transparency", Title = "Widget transparency", Min = 0, Max = 0.9, Increment = 0.05, Default = self._widgetT, Callback = function(v) self:SetWidgetTransparency(v) end })
@@ -2071,6 +2250,7 @@ local Prism = (function()
         w:_bind(card, "BackgroundColor3", "Surface")
         w:_glassify(card, 0.35)
         w:_corner(card, 0.7)
+        w:_edge(card)
         pad(card, w._d.cardPad, 14)
         local layout = New("UIListLayout", { Parent = card, Padding = UDim.new(0, w._d.gap), SortOrder = Enum.SortOrder.LayoutOrder })
         table.insert(w._densityRegs, { fn = function(d) layout.Padding = UDim.new(0, d.gap) end })
@@ -2107,7 +2287,7 @@ local Prism = (function()
     function Tab:_hover(card)
         local w = self.Window
         local hovered = false
-        local st = card:FindFirstChildOfClass("UIStroke")
+        local st = card:FindFirstChild("HoverStroke")
         card.MouseEnter:Connect(function()
             if w._touch then return end
             hovered = true
@@ -2264,6 +2444,7 @@ local Prism = (function()
         if pillMode then
             pill = New("Frame", rightAnchored({ Parent = header, Size = UDim2.fromOffset(74, 24), BackgroundColor3 = Color3.new(1, 1, 1) }))
             w:_corner(pill, "pill")
+            w:_edge(pill)
             pillText = New("TextLabel", {
                 Parent = pill, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Text = tostring(cfg.ButtonText or "Run"),
                 Font = w:_font("Bold"), TextSize = w:_ts(11), TextXAlignment = Enum.TextXAlignment.Center, TextTruncate = Enum.TextTruncate.AtEnd,
@@ -2318,6 +2499,7 @@ local Prism = (function()
         self:_hover(card)
         local track = New("Frame", rightAnchored({ Parent = header, Size = UDim2.fromOffset(tw, tth) }))
         w:_corner(track, "pill")
+        w:_edge(track, { inset = true })
         local thumb = New("Frame", { Parent = track, AnchorPoint = Vector2.new(0, 0.5), Size = UDim2.fromOffset(tk, tk), BorderSizePixel = 0 })
         w:_corner(thumb, "pill")
 
@@ -3306,6 +3488,7 @@ local Prism = (function()
 
         local track = New("Frame", { Parent = card, Size = UDim2.new(1, 0, 0, w._touch and 36 or 30), BorderSizePixel = 0, LayoutOrder = 2 })
         w:_corner(track, "pill")
+        w:_edge(track, { inset = true })
         w:_bind(track, "BackgroundColor3", "Elevated")
         local indicator = New("Frame", {
             Parent = track, Size = UDim2.new(1 / n, -6, 1, -6), Position = UDim2.new(0, 3, 0, 3),
@@ -3313,6 +3496,7 @@ local Prism = (function()
         })
         w:_corner(indicator, "pill")
         w:_bind(indicator, "BackgroundColor3", "Accent")
+        w:_edge(indicator)
 
         local labels = {}
         local function indexOf(v)
@@ -4038,6 +4222,8 @@ local Prism = (function()
             blur = self._blurOn, blurSize = self._blurSize, shadow = self._shadowOn, border = self._borderOn,
             anim = ANIM.speed, bgImage = self._bgImage, bgImageT = self._bgImageT, widgetT = self._widgetT,
             pinned = self._pinned == true,
+            weather = self._weather or "none", weatherDensity = self._weatherDensity or 1,
+            liquid = self._liquid == true, edges3d = self._bevel == true,
             widgets = widgets,
             enumTypes = enumTypes,
         }
@@ -4092,6 +4278,9 @@ local Prism = (function()
         if s.bgImage ~= nil or s.bgImageT ~= nil then self:SetBackgroundImage(s.bgImage, s.bgImageT) end
         if type(s.widgetT) == "number" then self:SetWidgetTransparency(s.widgetT) end
         if type(s.pinned) == "boolean" and s.pinned ~= (self._pinned == true) then self:SetPinned(s.pinned, true) end
+        if type(s.weather) == "string" then self:SetWeather(s.weather, { Density = s.weatherDensity }) end
+        if type(s.liquid) == "boolean" then self:SetLiquidGlass(s.liquid) end
+        if type(s.edges3d) == "boolean" then self:SetEdges3D(s.edges3d) end
     end
 
     -- Applies the profile marked as autoload in the config tab (safe to call any time).
@@ -4347,9 +4536,27 @@ local Prism = (function()
         self._borderStroke = borderStroke
         borderStroke.Enabled = self._borderOn
 
+        -- liquid-glass sheen (moving light streak) and the rim used by liquid glass / 3D edges
+        local sheen = New("Frame", { Name = "Sheen", Parent = main, BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), ZIndex = 0, Visible = false })
+        self._sheenCorner = self:_corner(sheen, 1)
+        local sheenGrad = New("UIGradient", { Parent = sheen, Rotation = 28, Transparency = NumberSequence.new({
+            kp(0, 0.84), kp(0.28, 0.95), kp(0.44, 0.92), kp(0.5, 0.86), kp(0.56, 0.93), kp(0.75, 0.97), kp(1, 0.99),
+        }) })
+        self._sheen, self._sheenGrad = sheen, sheenGrad
+        local rim = New("Frame", { Name = "Rim", Parent = main, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 20 })
+        self._rimCorner = self:_corner(rim, 1)
+        self:_edge(rim)
+        self:_connect(RunService.Heartbeat, function()
+            if self._liquid and sheen.Visible and ANIM.speed > 0 then
+                local t = os.clock() * ANIM.speed
+                sheenGrad.Offset = Vector2.new(math.sin(t * 0.35) * 0.28, math.cos(t * 0.23) * 0.06)
+                sheenGrad.Rotation = 28 + math.sin(t * 0.18) * 10
+            end
+        end)
+
         local bgImage = New("ImageLabel", {
             Name = "BackgroundImage", Parent = main, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
-            ScaleType = Enum.ScaleType.Crop, ZIndex = 0, Visible = false,
+            ScaleType = Enum.ScaleType.Crop, ZIndex = -1, Visible = false,
         })
         self._bgCorner = self:_corner(bgImage, 1)
         self._bgImageLabel = bgImage
@@ -4442,7 +4649,7 @@ local Prism = (function()
         })
         self:_corner(group, "pill")
         self:_bind(group, "BackgroundColor3", "Surface")
-        local groupStroke = self:_stroke(group, "Stroke"); groupStroke.Transparency = 0.45
+        self:_edge(group, { flat = { key = "Stroke", t = 0.45 } })
         pad(group, 0, 3, 0, 3)
         New("UIListLayout", {
             Parent = group, FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center,
@@ -4692,8 +4899,7 @@ local Prism = (function()
             })
             New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = fab })
             self:_bind(fab, "BackgroundColor3", "Surface")
-            local fabStroke = self:_stroke(fab, "Stroke")
-            fabStroke.Transparency = 0.2
+            self:_edge(fab, { flat = { key = "Stroke", t = 0.2 } })
             local mark = New("TextLabel", {
                 Parent = fab, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 21,
                 Text = string.upper(string.sub(tostring(cfg.Title or "P"), 1, 1)),
@@ -4761,6 +4967,9 @@ local Prism = (function()
         ActiveWindow = self
         self._animateTheme = true -- later theme changes cross-fade
         if cfg.Pinned then self:SetPinned(true, true) end
+        if cfg.Edges3D or cfg.Bevel then self:SetEdges3D(true) end
+        if cfg.LiquidGlass then self:SetLiquidGlass(true) end
+        if cfg.Weather then self:SetWeather(cfg.Weather, { Density = cfg.WeatherDensity, Color = cfg.WeatherColor }) end
         if type(cfg.KeySystem) == "table" then
             self:_startKeySystem(cfg.KeySystem)
         else
