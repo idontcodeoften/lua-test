@@ -2304,6 +2304,286 @@ local Prism = (function()
         if type(s.glass) == "number" then self:SetGlass(s.glass) end
         if type(s.pattern) == "string" then self:SetPattern(s.pattern) end
     end
+    Library.KeyProviders = {}
+
+    function Library:RegisterKeyProvider(id, spec)
+        Library.KeyProviders[id] = spec
+    end
+
+    function Library:RegisterCustomProvider(id, name, verifyFn, copyFn)
+        Library.KeyProviders[id] = {
+            Name = name or id,
+            Icon = "key-round",
+            Args = { "Key" },
+            Verify = verifyFn,
+            Copy = copyFn,
+        }
+    end
+
+    function Library:RegisterHttpProvider(id, spec)
+        Library.KeyProviders[id] = spec
+    end
+
+    local KEY_FILE = "prismui_key.txt"
+
+    local function loadSavedKey()
+        local ok, data
+        if typeof(writefile) == "function" and typeof(readfile) == "function" and typeof(isfile) == "function" then
+            ok = pcall(function()
+                if isfile(KEY_FILE) then data = readfile(KEY_FILE) end
+            end)
+            if ok and type(data) == "string" and data ~= "" then return data end
+        end
+        return getgenv().SCRIPT_KEY
+    end
+
+    local function saveKey(key)
+        if typeof(writefile) == "function" then
+            pcall(writefile, KEY_FILE, key)
+        end
+        getgenv().SCRIPT_KEY = key
+    end
+
+    local function clearSavedKey()
+        if typeof(delfile) == "function" then pcall(delfile, KEY_FILE) end
+        getgenv().SCRIPT_KEY = nil
+    end
+
+    local function resolveProvider(idOrSpec, cfg)
+        if type(idOrSpec) == "table" then
+            if idOrSpec.New then
+                local inst = idOrSpec.New()
+                return { Name = idOrSpec.Name or "Key", Icon = idOrSpec.Icon, Verify = inst.Verify, Copy = inst.Copy }
+            end
+            if idOrSpec.Verify then
+                return { Name = idOrSpec.Name or "Key", Icon = idOrSpec.Icon, Verify = idOrSpec.Verify, Copy = idOrSpec.Copy }
+            end
+        end
+        if type(idOrSpec) == "string" and Library.KeyProviders[idOrSpec] then
+            local spec = Library.KeyProviders[idOrSpec]
+            if spec.New then
+                local inst = spec.New()
+                return { Name = spec.Name or idOrSpec, Icon = spec.Icon, Verify = inst.Verify, Copy = inst.Copy }
+            end
+            return { Name = spec.Name or idOrSpec, Icon = spec.Icon, Verify = spec.Verify, Copy = spec.Copy }
+        end
+        warn("[PrismUI] unknown key provider: " .. tostring(idOrSpec))
+        return nil
+    end
+
+    local function runVerify(provider, key)
+        local ok, a, b = pcall(provider.Verify, key)
+        if not ok then
+            return false, tostring(a)
+        end
+        return a == true, b or (a == true and "Key valid" or "Invalid key")
+    end
+
+    function Library:CreateKeySystem(cfg)
+        cfg = cfg or {}
+        local saveKey = cfg.SaveKey == true
+        local identifier = cfg.Identifier or "1104813"
+        local provider   = cfg.Provider   or "KEY!"
+        local service    = cfg.Service    or "Key System"
+        local folder     = "PrismKeySystem"
+
+        local gui, window, tab, verifyFn, copyFn, link
+        local verifiedKey = nil
+
+        local Junkie
+        local function ensureJunkie()
+            if Junkie then return Junkie end
+            local ok, sdk = pcall(function()
+                return loadstring(game:HttpGet("https://jnkie.com/sdk/library.lua"))()
+            end)
+            if ok and sdk then
+                sdk.service    = service
+                sdk.identifier = identifier
+                sdk.provider   = provider
+                Junkie = sdk
+            end
+            return Junkie
+        end
+
+        local function keyPath()
+            return folder .. "/" .. tostring(identifier):gsub("[^%w_-]", "_") .. ".key"
+        end
+
+        local function loadSavedKey()
+            if not saveKey then return nil end
+            if type(readfile) ~= "function" or type(isfile) ~= "function" then return nil end
+            local ok, exists = pcall(isfile, keyPath())
+            if not ok or not exists then return nil end
+            local ok2, contents = pcall(readfile, keyPath())
+            if ok2 and type(contents) == "string" and #contents > 0 then return contents end
+            return nil
+        end
+
+        local function saveKeyValue(key)
+            if not saveKey then return end
+            if type(writefile) ~= "function" then return end
+            if type(makefolder) == "function" and type(isfolder) == "function" then
+                local ok, exists = pcall(isfolder, folder)
+                if ok and not exists then pcall(makefolder, folder) end
+            end
+            pcall(writefile, keyPath(), key)
+        end
+
+        local function clearSavedKey()
+            if type(delfile) ~= "function" then return end
+            pcall(delfile, keyPath())
+        end
+
+        local function defaultVerify(key)
+            if type(key) ~= "string" or key == "" then return false, "Enter a key first." end
+            local sdk = ensureJunkie()
+            if sdk then
+                local ok, result = pcall(function() return sdk.check_key(key) end)
+                if ok and type(result) == "table" then
+                    if result.valid then
+                        if result.message == "KEYLESS" then
+                            getgenv().SCRIPT_KEY = "KEYLESS"
+                            return true, "Keyless mode"
+                        end
+                        getgenv().SCRIPT_KEY = key
+                        return true, result.message or "Key valid"
+                    end
+                    return false, result.message or "Invalid key"
+                end
+            end
+            getgenv().SCRIPT_KEY = key
+            return true, "Key accepted"
+        end
+
+        local function defaultCopy()
+            local sdk = ensureJunkie()
+            if sdk and type(sdk.get_key_link) == "function" then
+                local ok, l = pcall(function() return sdk.get_key_link() end)
+                if ok and type(l) == "string" then
+                    if type(setclipboard) == "function" then pcall(setclipboard, l) end
+                    return l
+                end
+            end
+            return ""
+        end
+
+        verifyFn = cfg.Verify or defaultVerify
+        copyFn   = cfg.Copy   or defaultCopy
+        link     = ""
+
+        local function finishVerify(key, msg)
+            verifiedKey = key
+            saveKeyValue(key)
+            window:Notify({ Title = "Key Verified", Message = msg or "Access granted.", Type = "success", Duration = 3 })
+            task.delay(0.25, function()
+                if window then window:Destroy() end
+                if gui then gui:Destroy() end
+                if cfg.OnVerified then safe(cfg.OnVerified, key) end
+            end)
+        end
+
+        local function tryVerify(key)
+            local ok, valid, msg = pcall(verifyFn, key)
+            if not ok then
+                if cfg.OnInvalid then safe(cfg.OnInvalid, tostring(valid)) end
+                window:Notify({ Title = "Verification Error", Message = tostring(valid), Type = "error", Duration = 4 })
+                return false
+            end
+            if valid then
+                finishVerify(key, msg)
+                return true
+            else
+                if cfg.OnInvalid then safe(cfg.OnInvalid, msg) end
+                window:Notify({ Title = "Invalid Key", Message = msg or "That key is not valid.", Type = "error", Duration = 4 })
+                return false
+            end
+        end
+
+        window = self:CreateWindow({
+            Title = cfg.Title or "Key System",
+            Subtitle = cfg.Subtitle,
+            Tags = { provider },
+            Font = "Gotham",
+            TextScale = 1,
+            Density = "comfortable",
+            Glass = 0,
+            Pattern = "dots",
+            Blob = true,
+            Glow = false,
+            AnimatedBorder = true,
+            Theme = "Midnight",
+            Size = Vector2.new(400, 380),
+            Resizable = false,
+            Parent = cfg.Parent,
+        })
+        tab = window:AddTab({ Title = "Key", Icon = "file-cog" })
+
+        tab:AddParagraph({
+            Title = "Verification Required",
+            Description = cfg.Note or "Enter your key to continue.",
+        })
+        tab:AddDivider()
+
+        local keyBox = tab:AddInput({
+            Title = "License Key",
+            Placeholder = "Paste your key here...",
+            Callback = function(text, enter)
+                if enter then tryVerify(text) end
+            end,
+        })
+
+        tab:AddButton({
+            Title = "Verify & Continue",
+            Callback = function()
+                tryVerify(keyBox:Get())
+            end,
+        })
+
+        tab:AddButton({
+            Title = "Copy key link",
+            Description = "Copies the key page to your clipboard.",
+            Callback = function()
+                link = copyFn() or ""
+                if link ~= "" then
+                    window:Notify({ Title = "Copied", Message = "Key link copied to clipboard.", Type = "info", Duration = 3 })
+                else
+                    window:Notify({ Title = "Copy failed", Message = "Key link is unavailable.", Type = "warning", Duration = 3 })
+                end
+            end,
+        })
+
+        tab:AddDivider()
+        tab:AddParagraph({
+            Title = "About",
+            Description = ("Provider: %s\nService: %s\nIdentifier: %s"):format(tostring(provider), tostring(service), tostring(identifier)),
+        })
+
+        local saved = loadSavedKey()
+        if saved then
+            keyBox:Set(saved, true)
+            task.defer(function() tryVerify(saved) end)
+        end
+
+        local controller = {
+            Window = window,
+            Verify = function(key) return tryVerify(key) end,
+            Copy = function() return copyFn() end,
+            IsVerified = function() return verifiedKey ~= nil end,
+            Reset = function()
+                clearSavedKey()
+                verifiedKey = nil
+                if type(getgenv) == "function" then getgenv().SCRIPT_KEY = nil end
+            end,
+            Prompt = function()
+                if window and window.Holder then window.Toggle(true) end
+            end,
+        }
+
+        return controller
+    end
+
+
+
 
     function Library:CreateWindow(cfg)
         cfg = cfg or {}
