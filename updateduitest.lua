@@ -9,7 +9,7 @@
         Mobile = nil,                 -- nil = auto-detect touch, true/false to force
         MobileScale = 0.85,           -- UI scale used on phones when Scale isn't set
         Icon = nil,                   -- optional top-bar icon (asset id or icon name)
-        PinButton = true,             -- false hides the pin button
+        PinButton = false,            -- true adds a pin button to the top bar
         Weather = nil,                -- "snow" | "rain" | "stars" | "sakura"
         LiquidGlass = false,          -- see-through glass panels with a moving sheen
         Edges3D = false,              -- bevelled 3D edges
@@ -45,7 +45,7 @@
         never move the window.
       * New top bar: optional icon (cfg.Icon), title with tags, subtitle underneath, and the
         pin / minimize / close buttons grouped in a pill. Window:SetTitle(t) / :SetSubtitle(t).
-        cfg.PinButton = false removes the pin button entirely.
+        cfg.PinButton = true adds a pin button (off by default since 1.8.2).
       * Tooltips: themed, follow the mouse after a short delay, stay on screen; on touch,
         press and hold a card to see its tooltip (the hold doesn't trigger the card).
         Built-in tooltips on the top bar, widgets, sliders, keybinds and colour pickers.
@@ -418,18 +418,20 @@ local Prism = (function()
         local g = New("UIGradient", { Parent = st, Rotation = 90 })
         local WHITE, BLACK = Color3.new(1, 1, 1), Color3.new(0, 0, 0)
         self:_onTheme(inst, function()
-            if self._bevel then
+            if opts.hide and opts.hide() then
+                st.Enabled = false
+            elseif self._bevel then
                 local hi, lo = WHITE, BLACK
                 if opts.inset then hi, lo = BLACK, WHITE end
                 st.Enabled, st.Color, st.Transparency, st.Thickness = true, WHITE, 0, opts.inset and 1 or 1.25
                 g.Enabled = true
                 g.Color = ColorSequence.new({ ColorSequenceKeypoint.new(0, hi), ColorSequenceKeypoint.new(0.5, hi:Lerp(lo, 0.5)), ColorSequenceKeypoint.new(1, lo) })
-                g.Transparency = NumberSequence.new({ kp(0, opts.inset and 0.55 or 0.5), kp(0.5, 0.92), kp(1, opts.inset and 0.75 or 0.55) })
+                g.Transparency = NumberSequence.new({ kp(0, opts.inset and 0.55 or 0.5), kp(0.5, 0.8), kp(1, opts.inset and 0.75 or 0.6) })
             elseif self._liquid then
                 st.Enabled, st.Color, st.Transparency, st.Thickness = true, WHITE, 0, 1
                 g.Enabled = true
                 g.Color = ColorSequence.new(WHITE)
-                g.Transparency = NumberSequence.new({ kp(0, opts.inset and 0.9 or 0.5), kp(0.45, 0.86), kp(1, opts.inset and 0.85 or 0.93) })
+                g.Transparency = NumberSequence.new({ kp(0, opts.inset and 0.9 or 0.55), kp(0.5, 0.8), kp(1, opts.inset and 0.85 or 0.86) })
             elseif opts.flat then
                 st.Enabled, st.Thickness = true, 1
                 g.Enabled = false
@@ -686,6 +688,7 @@ local Prism = (function()
 
     function Window:SetCornerRadius(r)
         self.CornerRadius = math.clamp(r, 0, 28)
+        self:_paintShadow()
         for i = #self._corners, 1, -1 do
             local e = self._corners[i]
             if e.corner.Parent == nil then table.remove(self._corners, i) else self:_applyCorner(e) end
@@ -767,9 +770,21 @@ local Prism = (function()
         if self._shadow then self._shadow.Visible = self._shadowOn end
     end
 
+    function Window:_paintShadow()
+        for _, l in ipairs(self._shadowLayers or {}) do
+            if self._minimized then
+                l.corner.CornerRadius = UDim.new(1, 0)
+                l.layer.BackgroundTransparency = math.min(1, l.t + 0.05)
+            else
+                l.corner.CornerRadius = UDim.new(0, self.CornerRadius <= 0 and 0 or self.CornerRadius + l.grow)
+                l.layer.BackgroundTransparency = l.t
+            end
+        end
+    end
+
     function Window:SetBorder(on)
         self._borderOn = on ~= false
-        if self._borderStroke then self._borderStroke.Enabled = self._borderOn or self._animBorder == true end
+        self:_refresh()
     end
 
     function Window:SetAnimationSpeed(v)
@@ -953,22 +968,35 @@ local Prism = (function()
             local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
             local inset = GuiService:GetGuiInset()
             local sc = self._userScale or 1
-            local pillW = math.min(self._touch and 300 or 340, (vp.X - 24) / sc)
             local y = math.max(inset.Y / 2, H * sc / 2 + 6)
             self._body.Visible = false
             self._headerLine.Visible = false
             if self._pinBtn then self._pinBtn.Visible = false end
             if self._subLabel then self._subLabel.Visible = false end
+            -- single centred line, a little more room from the rounded end
+            self._line1.AnchorPoint = Vector2.new(0, 0.5)
+            self._line1.Position = UDim2.new(0, 0, 0.5, 0)
+            self._titleBlock.Position = UDim2.fromOffset(self._leftX + 6, 0)
             self:_headerRelayout()
+            -- width fits the title + tags + buttons
+            local acs = self._titleLayout and self._titleLayout.AbsoluteContentSize
+            local contentW = (acs and acs.X > 0) and (acs.X / sc) or 180
+            local maxW = math.min(self._touch and 340 or 420, (vp.X - 24) / sc)
+            local pillW = math.clamp(self._leftX + 6 + contentW + 18 + (self._controlsW or 70) + 12, 200, maxW)
             self:SetCornerRadius(self.CornerRadius)
+            self:_refresh()
             tween(self.Holder, { Size = UDim2.fromOffset(pillW, H), Position = UDim2.new(0.5, 0, 0, y) }, TI_POP)
         else
             self._body.Visible = true
             self._headerLine.Visible = true
             if self._pinBtn then self._pinBtn.Visible = self._pinAllowed end
             if self._subLabel then self._subLabel.Visible = true end
+            self._line1.AnchorPoint = Vector2.new(0, self._hasSub and 1 or 0.5)
+            self._line1.Position = UDim2.new(0, 0, 0.5, self._hasSub and 1 or 0)
+            self._titleBlock.Position = UDim2.fromOffset(self._leftX, 0)
             self:_headerRelayout()
             self:SetCornerRadius(self.CornerRadius)
+            self:_refresh()
             tween(self.Holder, {
                 Size = UDim2.fromOffset(self._size.X, self._size.Y),
                 Position = self._preMinimizePos or UDim2.fromScale(0.5, 0.5),
@@ -2341,6 +2369,9 @@ local Prism = (function()
         self._sectionStack = {}
 
         local wrap = New("Frame", { Parent = self.Page, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = self:_next() })
+        New("UIListLayout", { Parent = wrap, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder })
+        -- breathing room above every section except the first thing on the page
+        if self._order > 1 then pad(wrap, 8, 0, 0, 0) end
         local header = New("TextButton", { Parent = wrap, Text = "", AutoButtonColor = false, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 22), LayoutOrder = 1 })
         local label = New("TextLabel", {
             Parent = header, BackgroundTransparency = 1, Position = UDim2.fromOffset(4, 0), Size = UDim2.new(1, -30, 1, 0),
@@ -4512,21 +4543,40 @@ local Prism = (function()
             Size = UDim2.new(1, 40, 1, 40), Position = UDim2.fromScale(0.5, 0.5),
             AnchorPoint = Vector2.new(0.5, 0.5), ZIndex = -1, Visible = self._glow,
         })
+        glow.ImageTransparency = 1 -- replaced by rounded layers below
+        local glowLayers = {}
+        for i = 1, 4 do
+            local grow = i * 4
+            local layer = New("Frame", {
+                Parent = glow, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.new(1, grow * 2 - 40, 1, grow * 2 - 40), BackgroundTransparency = 0.8 + i * 0.04, BorderSizePixel = 0, ZIndex = -1,
+            })
+            local c = New("UICorner", { Parent = layer })
+            table.insert(glowLayers, { layer = layer, corner = c, grow = grow })
+        end
         self:_onTheme(glow, function()
-            glow.ImageColor3 = self.Theme.Accent
-            glow.ImageTransparency = 0.65
+            for _, l in ipairs(glowLayers) do
+                l.layer.BackgroundColor3 = self.Theme.Accent
+                l.corner.CornerRadius = self._minimized and UDim.new(1, 0) or UDim.new(0, self.CornerRadius + l.grow)
+            end
         end)
         self._glowImage = glow
 
-        -- soft drop shadow
-        local shadow = New("ImageLabel", {
-            Parent = holder, BackgroundTransparency = 1, Image = SHADOW_IMAGE,
-            ScaleType = Enum.ScaleType.Slice, SliceCenter = SHADOW_SLICE,
-            Size = UDim2.new(1, 64, 1, 64), Position = UDim2.new(0.5, 0, 0.5, 6),
-            AnchorPoint = Vector2.new(0.5, 0.5), ZIndex = -2, ImageColor3 = Color3.new(0, 0, 0),
-            ImageTransparency = 0.5, Visible = self._shadowOn,
-        })
+        -- soft drop shadow: stacked rounded layers, so it always matches the window's corners
+        local shadow = New("Frame", { Name = "Shadow", Parent = holder, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Position = UDim2.fromOffset(0, 4), ZIndex = -2, Visible = self._shadowOn })
+        self._shadowLayers = {}
+        for i = 1, 5 do
+            local grow = i * 3
+            local layer = New("Frame", {
+                Parent = shadow, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.new(1, grow * 2, 1, grow * 2), BackgroundColor3 = Color3.new(0, 0, 0),
+                BackgroundTransparency = 0.86 + i * 0.02, BorderSizePixel = 0, ZIndex = -2,
+            })
+            local c = New("UICorner", { Parent = layer })
+            table.insert(self._shadowLayers, { corner = c, grow = grow, layer = layer, t = layer.BackgroundTransparency })
+        end
         self._shadow = shadow
+        self:_paintShadow()
 
         local main = New("Frame", { Name = "Main", Parent = holder, Size = UDim2.fromScale(1, 1), BorderSizePixel = 0, ClipsDescendants = true })
         self:_bind(main, "BackgroundColor3", "Background")
@@ -4534,7 +4584,9 @@ local Prism = (function()
         self._mainCorner = self:_corner(main, 1)
         local borderStroke = self:_stroke(main, "Stroke")
         self._borderStroke = borderStroke
-        borderStroke.Enabled = self._borderOn
+        self:_onTheme(borderStroke, function()
+            borderStroke.Enabled = self._animBorder == true or (self._borderOn ~= false and not self._bevel and not self._liquid)
+        end)
 
         -- liquid-glass sheen (moving light streak) and the rim used by liquid glass / 3D edges
         local sheen = New("Frame", { Name = "Sheen", Parent = main, BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), ZIndex = 0, Visible = false })
@@ -4594,7 +4646,8 @@ local Prism = (function()
             Parent = titleBlock, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 20),
             AnchorPoint = Vector2.new(0, subText and 1 or 0.5), Position = UDim2.new(0, 0, 0.5, subText and 1 or 0),
         })
-        New("UIListLayout", {
+        self._titleBlock, self._line1, self._leftX, self._hasSub = titleBlock, line1, leftX, subText ~= nil
+        self._titleLayout = New("UIListLayout", {
             Parent = line1, FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center,
             Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder,
         })
@@ -4648,8 +4701,11 @@ local Prism = (function()
             Size = UDim2.fromOffset(0, BTN + 6), AutomaticSize = Enum.AutomaticSize.X, BorderSizePixel = 0,
         })
         self:_corner(group, "pill")
-        self:_bind(group, "BackgroundColor3", "Surface")
-        self:_edge(group, { flat = { key = "Stroke", t = 0.45 } })
+        self:_onTheme(group, function()
+            group.BackgroundColor3 = self.Theme.Surface
+            group.BackgroundTransparency = self._minimized and 1 or 0
+        end)
+        self:_edge(group, { flat = { key = "Stroke", t = 0.45 }, hide = function() return self._minimized == true end })
         pad(group, 0, 3, 0, 3)
         New("UIListLayout", {
             Parent = group, FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center,
@@ -4691,7 +4747,7 @@ local Prism = (function()
         local willFab = cfg.MobileButton == true or (cfg.MobileButton == nil and self._touch)
 
         -- pin: a pinned window always stays open
-        self._pinAllowed = cfg.PinButton ~= false
+        self._pinAllowed = cfg.PinButton == true
         local pinBtn = topButton(nil, 1, false, "Pin: keep the window open")
         pinBtn.Visible = self._pinAllowed
         local _, colorPin = drawPin(pinBtn)
@@ -4715,7 +4771,8 @@ local Prism = (function()
             local n = 0
             for _, b in ipairs({ pinBtn, minBtn, closeBtn }) do if b.Visible then n += 1 end end
             local gw = n * BTN + (n - 1) * 2 + 6
-            titleBlock.Size = UDim2.new(1, -(leftX + gw + 22), 1, 0)
+            titleBlock.Size = UDim2.new(1, -(titleBlock.Position.X.Offset + gw + 22), 1, 0)
+            self._controlsW = gw
         end
         self._headerRelayout()
 
