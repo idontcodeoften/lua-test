@@ -951,6 +951,27 @@ local Prism = (function()
         end
     end
 
+    -- Minimize / restore only changes the window's outer shell (pill corners, shadow, header). Repainting
+    -- every widget in every tab (_refresh) and every corner (SetCornerRadius) on each toggle was the main
+    -- cause of the laggy animation in big UIs. The shell lists are cached and rebuilt when widgets are added.
+    function Window:_shellRepaint()
+        local body = self._body
+        local cache = self._shellCache
+        if not cache or cache.np ~= #self._painters or cache.nc ~= #self._corners then
+            cache = { painters = {}, corners = {}, np = #self._painters, nc = #self._corners }
+            for _, p in ipairs(self._painters) do
+                if p.inst.Parent ~= nil and not (body and p.inst:IsDescendantOf(body)) then table.insert(cache.painters, p) end
+            end
+            for _, e in ipairs(self._corners) do
+                if e.corner.Parent ~= nil and not (body and e.corner:IsDescendantOf(body)) then table.insert(cache.corners, e) end
+            end
+            self._shellCache = cache
+        end
+        self:_paintShadow()
+        for _, e in ipairs(cache.corners) do if e.corner.Parent then self:_applyCorner(e) end end
+        for _, p in ipairs(cache.painters) do if p.inst.Parent then pcall(p.fn) end end
+    end
+
     function Window:SetMinimized(state)
         if state == nil then state = not self._minimized end
         state = state == true
@@ -983,11 +1004,15 @@ local Prism = (function()
             local contentW = (acs and acs.X > 0) and (acs.X / sc) or 180
             local maxW = math.min(self._touch and 340 or 420, (vp.X - 24) / sc)
             local pillW = math.clamp(self._leftX + 6 + contentW + 18 + (self._controlsW or 70) + 12, 200, maxW)
-            self:SetCornerRadius(self.CornerRadius)
-            self:_refresh()
+            self:_shellRepaint()
             tween(self.Holder, { Size = UDim2.fromOffset(pillW, H), Position = UDim2.new(0.5, 0, 0, y) }, TI_POP)
         else
-            self._body.Visible = true
+            -- the page stays hidden while the window grows, otherwise every card in the tab is laid out
+            -- again on every frame of the animation; it appears as the window finishes opening
+            local token = self._minimizeToken
+            task.delay(TI_POP.Time * 0.8, function()
+                if self._minimizeToken == token and not self._minimized then self._body.Visible = true end
+            end)
             self._headerLine.Visible = true
             if self._pinBtn then self._pinBtn.Visible = self._pinAllowed end
             if self._subLabel then self._subLabel.Visible = true end
@@ -995,8 +1020,7 @@ local Prism = (function()
             self._line1.Position = UDim2.new(0, 0, 0.5, self._hasSub and 1 or 0)
             self._titleBlock.Position = UDim2.fromOffset(self._leftX, 0)
             self:_headerRelayout()
-            self:SetCornerRadius(self.CornerRadius)
-            self:_refresh()
+            self:_shellRepaint()
             tween(self.Holder, {
                 Size = UDim2.fromOffset(self._size.X, self._size.Y),
                 Position = self._preMinimizePos or UDim2.fromScale(0.5, 0.5),
