@@ -845,6 +845,8 @@ local Prism = (function()
     end
 
     function Window:_paintShadow()
+        if self._shadow and self._shadow:IsA("ImageLabel") then self._shadow.ImageTransparency = self._minimized and 0.6 or 0.45 end
+        if self._glowImage then self._glowImage.ImageTransparency = self._minimized and 0.75 or 0.55 end
         for _, l in ipairs(self._shadowLayers or {}) do
             if self._minimized then
                 l.corner.CornerRadius = UDim.new(1, 0)
@@ -1169,6 +1171,7 @@ local Prism = (function()
         if ActiveWindow == self then ActiveWindow = nil end
         for _, c in ipairs(self._conns) do pcall(function() c:Disconnect() end) end
         for _, tw in ipairs(self._loops or {}) do pcall(function() tw:Cancel() end) end
+        if self._dragStep then self._dragStep:Disconnect(); self._dragStep = nil end
         if self._blur then
             local b = self._blur
             self._blur = nil
@@ -1428,7 +1431,7 @@ local Prism = (function()
 
     ------------------------------------------------------------------ floating widgets
     function Window:_draggable(handle, target, isLocked)
-        local input0, start, pos
+        local input0, start, pos, pending
         handle.InputBegan:Connect(function(i)
             if not isPress(i) or (isLocked and isLocked()) then return end
             input0, start, pos = i, i.Position, target.Position
@@ -1437,7 +1440,9 @@ local Prism = (function()
             if not input0 then return end
             local isMouse = input0.UserInputType == Enum.UserInputType.MouseButton1
             if (isMouse and i.UserInputType == Enum.UserInputType.MouseMovement) or (not isMouse and i == input0) then
-                target.Position = UDim2.new(pos.X.Scale, pos.X.Offset + (i.Position.X - start.X), pos.Y.Scale, pos.Y.Offset + (i.Position.Y - start.Y))
+                local np = UDim2.new(pos.X.Scale, pos.X.Offset + (i.Position.X - start.X), pos.Y.Scale, pos.Y.Offset + (i.Position.Y - start.Y))
+                if not pending then task.defer(function() if pending then target.Position = pending; pending = nil end end) end
+                pending = np
             end
         end)
         self:_connect(UserInputService.InputEnded, function(i)
@@ -4663,45 +4668,25 @@ local Prism = (function()
         self.Holder, self._scale = holder, scale
         tween(scale, { Scale = self._userScale }, TI_POP)
 
-        -- optional accent glow behind the window
+        -- soft 9-slice images for the glow and the drop shadow: one image each, smooth falloff,
+        -- no visible banding (the old stacked frames showed hard rings)
         local glow = New("ImageLabel", {
-            Parent = holder, BackgroundTransparency = 1, Image = SHADOW_IMAGE,
-            ScaleType = Enum.ScaleType.Slice, SliceCenter = SHADOW_SLICE,
-            Size = UDim2.new(1, 40, 1, 40), Position = UDim2.fromScale(0.5, 0.5),
-            AnchorPoint = Vector2.new(0.5, 0.5), ZIndex = -1, Visible = self._glow,
+            Name = "Glow", Parent = holder, BackgroundTransparency = 1, Image = SHADOW_IMAGE,
+            ScaleType = Enum.ScaleType.Slice, SliceCenter = SHADOW_SLICE, SliceScale = 0.6,
+            Size = UDim2.new(1, 70, 1, 70), Position = UDim2.fromScale(0.5, 0.5),
+            AnchorPoint = Vector2.new(0.5, 0.5), ZIndex = -1, Visible = self._glow, ImageTransparency = 0.55,
         })
-        glow.ImageTransparency = 1 -- replaced by rounded layers below
-        local glowLayers = {}
-        for i = 1, 4 do
-            local grow = i * 4
-            local layer = New("Frame", {
-                Parent = glow, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-                Size = UDim2.new(1, grow * 2 - 40, 1, grow * 2 - 40), BackgroundTransparency = 0.8 + i * 0.04, BorderSizePixel = 0, ZIndex = -1,
-            })
-            local c = New("UICorner", { Parent = layer })
-            table.insert(glowLayers, { layer = layer, corner = c, grow = grow })
-        end
-        self:_onTheme(glow, function()
-            for _, l in ipairs(glowLayers) do
-                l.layer.BackgroundColor3 = self.Theme.Accent
-                l.corner.CornerRadius = self._minimized and UDim.new(1, 0) or UDim.new(0, self.CornerRadius + l.grow)
-            end
-        end)
+        self:_bind(glow, "ImageColor3", "Accent")
         self._glowImage = glow
 
-        -- soft drop shadow: stacked rounded layers, so it always matches the window's corners
-        local shadow = New("Frame", { Name = "Shadow", Parent = holder, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Position = UDim2.fromOffset(0, 4), ZIndex = -2, Visible = self._shadowOn })
+        local shadow = New("ImageLabel", {
+            Name = "Shadow", Parent = holder, BackgroundTransparency = 1, Image = SHADOW_IMAGE,
+            ScaleType = Enum.ScaleType.Slice, SliceCenter = SHADOW_SLICE, SliceScale = 0.5,
+            ImageColor3 = Color3.new(0, 0, 0), ImageTransparency = 0.45,
+            Size = UDim2.new(1, 48, 1, 48), Position = UDim2.new(0.5, 0, 0.5, 6),
+            AnchorPoint = Vector2.new(0.5, 0.5), ZIndex = -2, Visible = self._shadowOn,
+        })
         self._shadowLayers = {}
-        for i = 1, 5 do
-            local grow = i * 3
-            local layer = New("Frame", {
-                Parent = shadow, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-                Size = UDim2.new(1, grow * 2, 1, grow * 2), BackgroundColor3 = Color3.new(0, 0, 0),
-                BackgroundTransparency = 0.86 + i * 0.02, BorderSizePixel = 0, ZIndex = -2,
-            })
-            local c = New("UICorner", { Parent = layer })
-            table.insert(self._shadowLayers, { corner = c, grow = grow, layer = layer, t = layer.BackgroundTransparency })
-        end
         self._shadow = shadow
         self:_paintShadow()
 
@@ -5130,6 +5115,14 @@ local Prism = (function()
             local p = Vector2.new(i.Position.X, i.Position.Y)
             if inRect(self._controlGroup, p) then return end
             dragging, dragInput, dragStart, startPos, moved = true, i, p, holder.Position, false
+            -- high-rate mice fire hundreds of move events a second; apply only the latest, once per frame
+            if self._dragStep then self._dragStep:Disconnect() end
+            self._dragStep = RunService.RenderStepped:Connect(function()
+                if self._dragPending then
+                    holder.Position = self._dragPending
+                    self._dragPending = nil
+                end
+            end)
         end)
         self:_connect(UserInputService.InputChanged, function(i)
             if not dragging then return end
@@ -5138,13 +5131,15 @@ local Prism = (function()
                 local d = Vector2.new(i.Position.X - dragStart.X, i.Position.Y - dragStart.Y)
                 if d.Magnitude > 6 then moved = true end
                 if moved then
-                    holder.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+                    self._dragPending = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
                 end
             end
         end)
         self:_connect(UserInputService.InputEnded, function(i)
             if dragging and (i == dragInput or i.UserInputType == Enum.UserInputType.MouseButton1) then
                 dragging = false
+                if self._dragPending then holder.Position = self._dragPending; self._dragPending = nil end
+                if self._dragStep then self._dragStep:Disconnect(); self._dragStep = nil end
                 if not moved and self._minimized then self:SetMinimized(false) end
             end
         end)
