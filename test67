@@ -10,6 +10,8 @@
         TopbarStyle = "default",      -- "default" | "mac" (traffic-light buttons)
         TitleGradient = false,        -- title text fades from text colour into the accent
         Breadcrumb = true,            -- shows "/ Current tab" after the title
+        GroupedSections = true,       -- each section is one card with its widgets as rows
+        PageTitles = true,            -- large title at the top of each tab
         Mobile = nil,                 -- nil = auto-detect touch, true/false to force
         MobileScale = 0.85,           -- UI scale used on phones when Scale isn't set
         Icon = nil,                   -- optional top-bar icon (asset id or icon name)
@@ -31,6 +33,28 @@
     })
 
     What's new in v1.9
+      * Fixes: switching to a single-weight font (Ubuntu, Oswald...) and back no longer leaves every
+        label bold; toasts measure and draw text with the active font; AddSection inside a column
+        stays in that column; :SetDisabled no longer rescans the whole card each call; a long title
+        row hides the breadcrumb, then tags, instead of overflowing.
+      * Layout: sections are now grouped cards: each section is one rounded card and its widgets are
+        rows inside it, split by hairlines, with an inset highlight on hover (cfg.GroupedSections =
+        false brings back one box per widget). Each tab starts with a large page title, plus an
+        optional line under it: AddTab({ Title, Icon, Description }) (cfg.PageTitles = false hides
+        them; hidden automatically on the phone tab strip). Every text box gets an accent focus
+        outline. Sidebar search shows "No results" and hides sections with nothing left; dropdown
+        search shows "No matches".
+      * Motion: shared presets (Prism.Motion.Fast/Base/Slow/Spring/Glide); switching tabs slides the
+        page up and reveals it top-to-bottom; one highlight glides between tabs (sidebar and phone
+        tab strip); card outlines light up on hover; ripple from the click point on buttons and
+        toggles; springy toggle knob; slider value bubble while dragging; soft fades at the top/bottom
+        of a page when there's more to scroll; dropdowns open as a floating menu (below the box, or
+        above it near the bottom) that closes on an outside click, scroll, tab switch or minimize.
+      * Fixed: colour picker square/bars were offset vertically by the Roblox top bar height.
+      * Performance: every drag (window, widgets, sliders, colour picker, resize, bubble, toast swipe)
+        shares one pointer handler that updates once per frame; theme fades and rainbow mode only
+        repaint the visible tab; one reused tooltip; weather particles run on engine tweens; fixed a
+        listener leak where every notification left a permanent input listener behind.
       * 24 fonts (was 4): BuilderSans, Gotham, GothamBlack, Montserrat, SourceSans, Arimo, Ubuntu,
         Nunito, Roboto, RobotoCondensed, TitilliumWeb, Oswald, JosefinSans, Jura, Michroma, Sarpanch,
         Merriweather, FredokaOne, PatrickHand, Kalam, Arcade, SciFi, RobotoMono, Code.
@@ -207,8 +231,18 @@ local Prism = (function()
     end
     FONT_MAP.Gotham = FONT_MAP.Gotham or { Normal = Enum.Font.SourceSans, Medium = Enum.Font.SourceSans, Bold = Enum.Font.SourceSansBold }
 
-    local TI     = TweenInfo.new(0.18, Enum.EasingStyle.Quad,  Enum.EasingDirection.Out)
-    local TI_POP = TweenInfo.new(0.30, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+    -- Motion presets. Everything animates with one of these, so the whole UI moves the same way
+    -- (fast ease-out like most modern websites). Library.Motion exposes them for scripts.
+    local MOTION = {
+        Fast   = TweenInfo.new(0.12, Enum.EasingStyle.Quad,  Enum.EasingDirection.Out),  -- hovers, presses
+        Base   = TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),  -- most state changes
+        Slow   = TweenInfo.new(0.36, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),  -- panels, pages, window
+        Spring = TweenInfo.new(0.42, Enum.EasingStyle.Back,  Enum.EasingDirection.Out),  -- small playful pops
+        Glide  = TweenInfo.new(0.32, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), -- the tab highlight
+        Snap   = TweenInfo.new(0.34, Enum.EasingStyle.Back,  Enum.EasingDirection.Out),  -- toggle knob
+    }
+    local TI     = MOTION.Base
+    local TI_POP = MOTION.Slow
     local SHADOW_IMAGE = "rbxassetid://6014261993"
     local SHADOW_SLICE = Rect.new(49, 49, 450, 450)
     local ICONS = {
@@ -224,6 +258,7 @@ local Prism = (function()
     }
     Library.Icons = ICONS
     Library.Fonts = FONT_ORDER
+    Library.Motion = MOTION
 
     ------------------------------------------------------------------ themes
     local function rgb(r, g, b) return Color3.fromRGB(r, g, b) end
@@ -372,6 +407,14 @@ local Prism = (function()
         self.Theme = t
     end
 
+    function Window:_paintPage(page)
+        if not (self._dirtyPages and self._dirtyPages[page]) then return end
+        self._dirtyPages[page] = nil
+        for _, p in ipairs(self._painters) do
+            if p.page == page and p.inst.Parent then pcall(p.fn) end
+        end
+    end
+
     function Window:_onTheme(inst, fn)
         table.insert(self._painters, { inst = inst, fn = fn })
         fn()
@@ -398,11 +441,39 @@ local Prism = (function()
         self:_onTheme(inst, function() inst.BackgroundTransparency = (self._glass or 0) * maxT end)
     end
 
-    function Window:_refresh()
+    -- Which tab page (if any) an instance lives on. Cached per painter the first time it's known.
+    function Window:_pageOf(inst)
+        local pages = self._pages
+        if not pages then return nil end
+        local node = inst
+        while node and node.Parent do
+            if node.Parent == pages then return node:IsA("ScrollingFrame") and node or false end
+            node = node.Parent
+        end
+        if node == game then return false end -- on screen but not on a tab page (top bar, sidebar...)
+        return nil -- not attached yet; try again next time
+    end
+
+    -- Repaints themed instances. Widgets on hidden tabs are skipped and marked stale; they're
+    -- repainted when their tab is opened (see _paintPage). On big UIs most widgets sit on hidden
+    -- tabs, so theme fades and rainbow mode only touch what's on screen. full = true paints everything.
+    function Window:_refresh(full)
+        self._dirtyPages = self._dirtyPages or {}
         for i = #self._painters, 1, -1 do
             local p = self._painters[i]
-            if p.inst.Parent == nil then table.remove(self._painters, i) else pcall(p.fn) end
+            if p.inst.Parent == nil then
+                table.remove(self._painters, i)
+            else
+                if p.page == nil then p.page = self:_pageOf(p.inst) end
+                local pg = p.page
+                if not full and pg and not pg.Visible then
+                    self._dirtyPages[pg] = true
+                else
+                    pcall(p.fn)
+                end
+            end
         end
+        if full then self._dirtyPages = {} end
         for i = #self._textRegs, 1, -1 do
             local r = self._textRegs[i]
             if r.inst.Parent == nil then table.remove(self._textRegs, i) end
@@ -506,13 +577,22 @@ local Prism = (function()
         return st
     end
 
-    function Window:_text(parent, text, size, font, key)
+    -- weight is "Normal" | "Medium" | "Bold" (a Font enum is still accepted for old callers)
+    function Window:_text(parent, text, size, weight, key)
+        local font
+        if type(weight) == "string" then
+            font = self:_font(weight)
+        else
+            font = weight
+            local fm = FONT_MAP[self._fontName] or FONT_MAP.Gotham
+            weight = font == fm.Normal and "Normal" or (font == fm.Medium and "Medium" or (font == fm.Bold and "Bold" or "Normal"))
+        end
         local l = New("TextLabel", {
             Parent = parent, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, self:_ts(size) + 2),
             AutomaticSize = Enum.AutomaticSize.Y, Text = text or "", TextSize = self:_ts(size), Font = font,
             TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
         })
-        self:_styleLabel(l, font == FONT_MAP[self._fontName].Bold and "Bold" or (font == FONT_MAP[self._fontName].Medium and "Medium" or "Normal"), size)
+        self:_styleLabel(l, weight, size)
         self:_bind(l, "TextColor3", key)
         return l
     end
@@ -530,17 +610,18 @@ local Prism = (function()
     -- Themed tooltip. Mouse: hover for a moment, follows the cursor. Touch: press and hold.
     function Window:_tooltip(inst, text)
         if not text or text == "" then return end
+        -- one tooltip label per window, reused by every control (no create/destroy per hover)
         local tip, token = nil, 0
         local function kill()
             token += 1
-            if tip then
-                local t = tip
-                tip = nil
+            if tip and self._tipOwner == inst then
+                local t, my = tip, self._tipSerial
+                self._tipOwner = nil
                 tween(t, { BackgroundTransparency = 1, TextTransparency = 1 }, TweenInfo.new(0.1))
-                local st = t:FindFirstChildOfClass("UIStroke")
-                if st then tween(st, { Transparency = 1 }, TweenInfo.new(0.1)) end
-                task.delay(0.12, function() t:Destroy() end)
+                tween(self._tipStroke, { Transparency = 1 }, TweenInfo.new(0.1))
+                task.delay(0.12, function() if self._tipSerial == my and self._tipOwner == nil then t.Visible = false end end)
             end
+            tip = nil
         end
         -- pos is in screen pixels (top bar included), which is this gui's offset space
         local function place(pos, above)
@@ -553,21 +634,28 @@ local Prism = (function()
         end
         local function show(pos, above)
             kill()
-            tip = New("TextLabel", {
-                Parent = self.Gui, Text = text, Font = self:_font("Medium"), TextSize = self:_ts(12),
-                AnchorPoint = Vector2.new(0, 1), AutomaticSize = Enum.AutomaticSize.XY, Size = UDim2.fromOffset(0, 0),
-                ZIndex = 200, BorderSizePixel = 0, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
-                BackgroundColor3 = self.Theme.Elevated, TextColor3 = self.Theme.Text,
-                BackgroundTransparency = 1, TextTransparency = 1,
-            })
-            New("UISizeConstraint", { Parent = tip, MaxSize = Vector2.new(240, math.huge) })
-            New("UICorner", { Parent = tip, CornerRadius = UDim.new(0, 8) })
-            New("UIStroke", { Parent = tip, Thickness = 1, Color = self.Theme.Stroke, Transparency = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
-            pad(tip, 6, 10)
+            if not self._tipLabel then
+                local l = New("TextLabel", {
+                    Parent = self.Gui, Name = "Tooltip", AnchorPoint = Vector2.new(0, 1), AutomaticSize = Enum.AutomaticSize.XY,
+                    Size = UDim2.fromOffset(0, 0), ZIndex = 200, BorderSizePixel = 0, TextWrapped = true,
+                    TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1, TextTransparency = 1, Visible = false,
+                })
+                New("UISizeConstraint", { Parent = l, MaxSize = Vector2.new(240, math.huge) })
+                New("UICorner", { Parent = l, CornerRadius = UDim.new(0, 8) })
+                self._tipStroke = New("UIStroke", { Parent = l, Thickness = 1, Transparency = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
+                pad(l, 6, 10)
+                self._tipLabel = l
+            end
+            tip = self._tipLabel
+            self._tipOwner = inst
+            self._tipSerial = (self._tipSerial or 0) + 1
+            tip.Text, tip.Font, tip.TextSize = text, self:_font("Medium"), self:_ts(12)
+            tip.BackgroundColor3, tip.TextColor3, self._tipStroke.Color = self.Theme.Elevated, self.Theme.Text, self.Theme.Stroke
+            tip.Visible = true
             place(pos, above)
             task.defer(function() place(pos, above) end) -- once its size is known
             tween(tip, { BackgroundTransparency = 0.02, TextTransparency = 0 }, TweenInfo.new(0.12))
-            tween(tip:FindFirstChildOfClass("UIStroke"), { Transparency = 0.2 }, TweenInfo.new(0.12))
+            tween(self._tipStroke, { Transparency = 0.2 }, TweenInfo.new(0.12))
         end
 
         -- mouse
@@ -625,7 +713,129 @@ local Prism = (function()
         return false
     end
 
+    -- Screen pixels per window pixel (UIScale + open/close scale), for converting AbsolutePosition.
+    function Window:_uiScale()
+        local h = self.Holder
+        if not h then return 1 end
+        local sc = h.AbsoluteSize.X / math.max(h.Size.X.Offset, 1)
+        return sc > 0.01 and sc or 1
+    end
+
+    -- Ripple from the press point. Drawn in a clip frame laid over the card on a layer inside the page
+    -- area (cards use list layouts, so they can't hold free-floating children without shifting).
+    function Window:_ripple(card, input)
+        if ANIM.speed <= 0 or not self._pages or card.AbsoluteSize.X <= 0 then return end
+        local layer = self._rippleLayer
+        if not layer then
+            layer = New("Frame", { Name = "Ripples", Parent = self._pages, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 40 })
+            self._rippleLayer = layer
+        end
+        local sc = self:_uiScale()
+        local origin = (card.AbsolutePosition - layer.AbsolutePosition) / sc
+        local size = card.AbsoluteSize / sc
+        local clip = New("Frame", { Parent = layer, BackgroundTransparency = 1, ClipsDescendants = true, ZIndex = 40,
+            Position = UDim2.fromOffset(origin.X, origin.Y), Size = UDim2.fromOffset(size.X, size.Y) })
+        -- input positions exclude the top bar inset; this gui (IgnoreGuiInset) includes it
+        local rel = (Vector2.new(input.Position.X, input.Position.Y + GuiService:GetGuiInset().Y) - card.AbsolutePosition) / sc
+        local d = math.max(size.X, size.Y) * 2.2
+        local r = New("Frame", { Parent = clip, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(rel.X, rel.Y),
+            Size = UDim2.fromOffset(0, 0), BorderSizePixel = 0, BackgroundColor3 = self.Theme.Accent, BackgroundTransparency = 0.84, ZIndex = 40 })
+        New("UICorner", { Parent = r, CornerRadius = UDim.new(1, 0) })
+        local info = TweenInfo.new(0.55 / ANIM.speed, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+        TweenService:Create(r, info, { Size = UDim2.fromOffset(d, d), BackgroundTransparency = 1 }):Play()
+        task.delay(info.Time + 0.05, function() clip:Destroy() end)
+    end
+
+    -- Accent outline that fades in while a text box has focus.
+    function Window:_focusRing(box)
+        local st = New("UIStroke", { Name = "FocusRing", Parent = box, Thickness = 1.5, Transparency = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
+        self:_bind(st, "Color", "Accent")
+        box.Focused:Connect(function() tween(st, { Transparency = 0.15 }, MOTION.Fast) end)
+        box.FocusLost:Connect(function() tween(st, { Transparency = 1 }, MOTION.Fast) end)
+        return st
+    end
+
+    -- Layer for floating menus (dropdowns). Lives in the window so it scales and moves with it.
+    function Window:_popupLayer()
+        if not self._popups then
+            self._popups = New("Frame", { Name = "Popups", Parent = self.Holder, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 60 })
+        end
+        return self._popups
+    end
+
+    function Window:_openPopup(p)
+        if self._popup and self._popup.frame ~= p.frame then self:_closePopup() end
+        self._popup = p
+        if not self._popupWatch then
+            self._popupWatch = true
+            self:_connect(UserInputService.InputBegan, function(i)
+                local cur = self._popup
+                if not cur or not isPress(i) then return end
+                local pt = Vector2.new(i.Position.X, i.Position.Y + GuiService:GetGuiInset().Y)
+                local function inside(g)
+                    if not g or not g.Parent then return false end
+                    local ap, as = g.AbsolutePosition, g.AbsoluteSize
+                    return pt.X >= ap.X and pt.X <= ap.X + as.X and pt.Y >= ap.Y and pt.Y <= ap.Y + as.Y
+                end
+                if not inside(cur.frame) and not inside(cur.anchor) then self:_closePopup() end
+            end)
+        end
+    end
+
+    function Window:_closePopup()
+        local p = self._popup
+        if not p then return end
+        self._popup = nil
+        pcall(p.close)
+    end
+
     function Window:_connect(signal, fn) table.insert(self._conns, signal:Connect(fn)) end
+
+    -- Pointer capture. Every drag in the UI (window, widgets, sliders, colour picker, resize, bubble,
+    -- swipe) goes through here: two global listeners in total instead of two per control, and the
+    -- move callback runs at most once per rendered frame with the latest pointer position, so
+    -- 1000 Hz mice don't flood the UI with updates. Only one drag can be active at a time.
+    function Window:_capture(input, onMove, onEnd)
+        if not self._capReady then
+            self._capReady = true
+            self:_connect(UserInputService.InputChanged, function(i)
+                local c = self._cap
+                if c and ((c.mouse and i.UserInputType == Enum.UserInputType.MouseMovement) or (not c.mouse and i == c.input)) then
+                    c.pos = i.Position
+                end
+            end)
+            self:_connect(UserInputService.InputEnded, function(i)
+                local c = self._cap
+                if c and (i == c.input or (c.mouse and i.UserInputType == Enum.UserInputType.MouseButton1)) then
+                    self:_release(i)
+                end
+            end)
+        end
+        if self._cap then self:_release(nil) end
+        local c = { input = input, mouse = input.UserInputType == Enum.UserInputType.MouseButton1, move = onMove, ended = onEnd }
+        c.step = RunService.RenderStepped:Connect(function()
+            local p = c.pos
+            if p and c.move then
+                c.pos = nil
+                local ok, err = pcall(c.move, p)
+                if not ok then warn("[PrismUI] drag error: " .. tostring(err)) end
+            end
+        end)
+        self._cap = c
+        return c
+    end
+
+    function Window:_release(input)
+        local c = self._cap
+        if not c then return end
+        self._cap = nil
+        if c.step then c.step:Disconnect() end
+        if c.pos and c.move then pcall(c.move, c.pos) end -- flush the last position
+        if c.ended then
+            local ok, err = pcall(c.ended, input)
+            if not ok then warn("[PrismUI] drag error: " .. tostring(err)) end
+        end
+    end
 
     ------------------------------------------------------------------ public window API
     function Window:SetTheme(theme)
@@ -667,7 +877,10 @@ local Prism = (function()
         local t = self._touch
         self._d = { cardPad = c and 8 or (t and 13 or 11), gap = c and 5 or 6, rowH = c and 24 or 28, headerH = c and 20 or (t and 28 or 24) }
         -- Live-update paddings/gaps made density-aware.
-        for _, e in ipairs(self._densityRegs) do e.fn(self._d) end
+        for i = #self._densityRegs, 1, -1 do
+            local e = self._densityRegs[i]
+            if e.inst and e.inst.Parent == nil then table.remove(self._densityRegs, i) else e.fn(self._d) end
+        end
     end
 
     function Window:SetGlass(t)
@@ -763,6 +976,7 @@ local Prism = (function()
         if self._locked then return end
         if state == nil then state = not self._open end
         if not state and self._pinned then self:_pinNudge() return end
+        if not state then self:_closePopup() end
         self._open = state
         self._visibilityToken = (self._visibilityToken or 0) + 1
         local token = self._visibilityToken
@@ -935,6 +1149,8 @@ local Prism = (function()
     local WEATHER_COUNT = { snow = 70, rain = 90, stars = 60, sakura = 26 }
     local WEATHER_TINT = { snow = Color3.new(1, 1, 1), rain = rgb(170, 196, 236), stars = Color3.new(1, 1, 1), sakura = rgb(255, 183, 213) }
 
+    -- Every particle is driven by looping tweens (fall, sway, spin, twinkle), so the engine animates
+    -- them and no Lua runs per particle per frame. A 5 Hz check pauses them while the window is hidden.
     function Window:SetWeather(mode, opts)
         opts = opts or {}
         mode = string.lower(tostring(mode or "none"))
@@ -942,52 +1158,102 @@ local Prism = (function()
         self._weather = mode
         if opts.Density ~= nil then self._weatherDensity = math.clamp(tonumber(opts.Density) or 1, 0.2, 2.5) end
         if opts.Color ~= nil then self._weatherColor = opts.Color end
+        for _, tw in ipairs(self._fxLoops or {}) do tw:Cancel() end
         for _, p in ipairs(self._fxParts or {}) do p.f:Destroy() end
-        self._fxParts = {}
+        self._fxParts, self._fxLoops, self._fxRunning = {}, {}, false
+        self._fxGen = (self._fxGen or 0) + 1
         if not self._fx then
             self._fx = New("Frame", { Name = "Atmosphere", Parent = self.Gui, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 0, Visible = false })
-            self._fxAlpha = 0
             self:_onTheme(self._fx, function() self:_paintFx() end)
-            self:_connect(RunService.Heartbeat, function(dt) self:_stepFx(dt) end)
+            local acc = 0
+            self:_connect(RunService.Heartbeat, function(dt)
+                acc += dt
+                if acc < 0.2 then return end
+                acc = 0
+                self:_syncFx()
+            end)
         end
         if mode == "none" then self._fx.Visible = false return end
         local cam = workspace.CurrentCamera
         local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
         local n = math.floor(WEATHER_COUNT[mode] * (self._weatherDensity or 1) * (self._touch and 0.6 or 1) + 0.5)
+        local LIN, SINE = Enum.EasingStyle.Linear, Enum.EasingStyle.Sine
+        local function loop(inst, props, time, reverses, style, delay)
+            local tw = TweenService:Create(inst, TweenInfo.new(time, style or LIN, Enum.EasingDirection.InOut, -1, reverses == true), props)
+            table.insert(self._fxLoops, tw)
+            return { tw = tw, delay = delay or 0 }
+        end
         for _ = 1, n do
-            local p = { phase = math.random() * 6.283, x = math.random(), y = math.random() }
-            local f = New("Frame", { Parent = self._fx, AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0, BackgroundTransparency = 1 })
-            if mode == "snow" then
-                p.size = math.random(2, 5)
-                p.vy = 0.035 + math.random() * 0.06 + p.size * 0.006
-                p.sway, p.base = 0.004 + math.random() * 0.01, 0.15 + math.random() * 0.4
-                f.Size = UDim2.fromOffset(p.size, p.size)
+            local x = math.random()
+            local holder = New("Frame", { Parent = self._fx, AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1, Size = UDim2.fromOffset(1, 1) })
+            local f = New("Frame", { Parent = holder, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), BorderSizePixel = 0 })
+            local p = { f = f, holder = holder, starts = {} }
+            if mode == "snow" or mode == "sakura" then
+                local size = mode == "snow" and math.random(2, 5) or math.random(6, 10)
+                local vy = mode == "snow" and (0.035 + math.random() * 0.06 + size * 0.006) or (0.045 + math.random() * 0.05)
+                local fall = 1.1 / vy
+                f.Size = mode == "snow" and UDim2.fromOffset(size, size) or UDim2.fromOffset(size, math.floor(size * 0.65))
+                f.BackgroundTransparency = mode == "snow" and (0.15 + math.random() * 0.4) or (0.1 + math.random() * 0.25)
                 New("UICorner", { Parent = f, CornerRadius = UDim.new(1, 0) })
+                local drift = mode == "sakura" and (0.1 + math.random() * 0.15) or 0
+                holder.Position = UDim2.fromScale(x - drift / 2, -0.05)
+                table.insert(p.starts, loop(holder, { Position = UDim2.fromScale(x + drift / 2, 1.05) }, fall, false, LIN, math.random() * fall))
+                local sway = math.floor(vp.X * (mode == "snow" and (0.004 + math.random() * 0.01) or 0.012))
+                f.Position = UDim2.new(0.5, -sway, 0.5, 0)
+                table.insert(p.starts, loop(f, { Position = UDim2.new(0.5, sway, 0.5, 0) }, 2 + math.random() * 2, true, SINE))
+                if mode == "sakura" then
+                    f.Rotation = math.random(0, 359)
+                    table.insert(p.starts, loop(f, { Rotation = f.Rotation + (math.random() < 0.5 and -360 or 360) }, 2 + math.random() * 3, false))
+                end
             elseif mode == "rain" then
                 local len = math.random(12, 22)
-                p.vy = 0.9 + math.random() * 0.6
-                p.vx = p.vy * 0.12
-                p.base = 0.45 + math.random() * 0.3
+                local vy = 0.9 + math.random() * 0.6
+                local fall = 1.1 / vy
                 f.Size = UDim2.fromOffset(1, len)
-                f.Rotation = -math.deg(math.atan2(p.vx * vp.X, p.vy * vp.Y))
+                f.Rotation = -math.deg(math.atan2(0.12 * vp.X, vp.Y))
+                f.BackgroundTransparency = 0.45 + math.random() * 0.3
+                holder.Position = UDim2.fromScale(x - 0.07, -0.05)
+                table.insert(p.starts, loop(holder, { Position = UDim2.fromScale(x + 0.07, 1.05) }, fall, false, LIN, math.random() * fall))
             elseif mode == "stars" then
-                p.size = math.random(1, 3)
-                p.vy, p.tw = -(0.002 + math.random() * 0.006), 0.8 + math.random() * 2
-                p.base = 0.1 + math.random() * 0.3
-                f.Size = UDim2.fromOffset(p.size, p.size)
+                local size = math.random(1, 3)
+                f.Size = UDim2.fromOffset(size, size)
                 New("UICorner", { Parent = f, CornerRadius = UDim.new(1, 0) })
-            elseif mode == "sakura" then
-                p.size = math.random(6, 10)
-                p.vy, p.vx = 0.045 + math.random() * 0.05, 0.015 + math.random() * 0.03
-                p.sway, p.spin = 0.012, (math.random() - 0.5) * 220
-                p.base = 0.1 + math.random() * 0.25
-                f.Size = UDim2.fromOffset(p.size, math.floor(p.size * 0.65))
-                New("UICorner", { Parent = f, CornerRadius = UDim.new(1, 0) })
+                holder.Position = UDim2.fromScale(x, math.random())
+                local base = 0.1 + math.random() * 0.3
+                f.BackgroundTransparency = base
+                table.insert(p.starts, loop(f, { BackgroundTransparency = base + (1 - base) * 0.65 }, 0.6 + math.random() * 1.6, true, SINE, math.random() * 2))
             end
-            p.f = f
+            -- falling particles stay hidden until their first fall starts, so they don't all begin in a row
+            holder.Visible = mode == "stars"
             table.insert(self._fxParts, p)
         end
         self:_paintFx()
+        self:_syncFx()
+    end
+
+    function Window:_syncFx()
+        if not self._fx or self._weather == nil or self._weather == "none" then return end
+        local want = ((self._locked and self._gate ~= nil) or (self._open and not self._minimized) or self._weatherAlways) and ANIM.speed > 0
+        self._fx.Visible = want
+        if want == self._fxRunning then return end
+        self._fxRunning = want
+        local gen = self._fxGen
+        for _, p in ipairs(self._fxParts or {}) do
+            for _, st in ipairs(p.starts) do
+                if not want then
+                    st.tw:Pause()
+                elseif st.started or st.delay <= 0 then
+                    st.started = true
+                    p.holder.Visible = true
+                    st.tw:Play()
+                else
+                    st.started = true
+                    task.delay(st.delay, function()
+                        if self._fxGen == gen and self._fxRunning then p.holder.Visible = true; st.tw:Play() end
+                    end)
+                end
+            end
+        end
     end
 
     function Window:_paintFx()
@@ -998,39 +1264,6 @@ local Prism = (function()
         for i, p in ipairs(self._fxParts or {}) do
             -- a little variety for petals
             p.f.BackgroundColor3 = (mode == "sakura" and i % 3 == 0) and c:Lerp(Color3.new(1, 1, 1), 0.35) or c
-        end
-    end
-
-    function Window:_stepFx(dt)
-        if not self._fx or self._weather == nil or self._weather == "none" then return end
-        self._fxAcc = (self._fxAcc or 0) + dt
-        if self._fxAcc < 1 / 40 and self._fx.Visible then return end
-        dt, self._fxAcc = self._fxAcc, 0
-        local want = (self._locked and self._gate ~= nil) or (self._open and not self._minimized) or self._weatherAlways
-        local a = self._fxAlpha or 0
-        if want and a < 1 then a = math.min(1, a + dt * 2.5) elseif not want and a > 0 then a = math.max(0, a - dt * 3) end
-        self._fxAlpha = a
-        if a <= 0 then self._fx.Visible = false return end
-        self._fx.Visible = true
-        dt = math.min(dt, 0.1) * math.max(ANIM.speed, 0.15)
-        local t = os.clock()
-        local mode = self._weather
-        for _, p in ipairs(self._fxParts) do
-            local tr = p.base
-            p.y += p.vy * dt
-            if mode == "stars" then
-                if p.y < -0.02 then p.y, p.x = 1.02, math.random() end
-                tr = p.base + (1 - p.base) * 0.65 * (0.5 + 0.5 * math.sin(t * p.tw + p.phase))
-                p.f.Position = UDim2.fromScale(p.x, p.y)
-            else
-                p.x += (p.vx or 0) * dt
-                if p.y > 1.05 then p.y, p.x = -0.05, math.random() * 1.1 - (p.vx and 0.12 or 0) end
-                if p.x > 1.05 then p.x -= 1.1 end
-                local x = p.x + (p.sway and math.sin(t * 1.3 + p.phase) * p.sway or 0)
-                p.f.Position = UDim2.fromScale(x, p.y)
-                if p.spin then p.f.Rotation = (t * p.spin + p.phase * 57) % 360 end
-            end
-            p.f.BackgroundTransparency = 1 - (1 - tr) * a
         end
     end
 
@@ -1062,6 +1295,7 @@ local Prism = (function()
         if state == (self._minimized == true) then return end
         self._minimized = state
         if self._crumb then self._crumb.Visible = not state end
+        self:_closePopup()
         task.defer(function() self:_syncLoops() end)
         task.defer(function() self:_syncBlur() end)
         self._minIcon.Image = resolveIcon(state and "maximize-2" or "minimize-2")
@@ -1114,6 +1348,28 @@ local Prism = (function()
     end
 
     function Window:IsMinimized() return self._minimized == true end
+
+    -- When the title row doesn't fit, hide the breadcrumb first, then the tags (title always stays).
+    function Window:_fitTitleRow()
+        local block, layout = self._titleBlock, self._titleLayout
+        if not block or not layout then return end
+        local tags = {}
+        for _, c in ipairs(self._line1:GetChildren()) do
+            if c:IsA("TextLabel") and c ~= self._titleLabel and c ~= self._crumb then table.insert(tags, c) end
+        end
+        local crumbWanted = self._crumb ~= nil and not self._minimized
+        if self._crumb then self._crumb.Visible = crumbWanted end
+        for _, t in ipairs(tags) do t.Visible = true end
+        task.defer(function()
+            local avail = block.AbsoluteSize.X
+            if avail <= 0 then return end
+            if layout.AbsoluteContentSize.X > avail and self._crumb then self._crumb.Visible = false end
+            for i = #tags, 1, -1 do
+                if layout.AbsoluteContentSize.X <= avail then break end
+                tags[i].Visible = false
+            end
+        end)
+    end
 
     function Window:SetTitle(text)
         if self._titleLabel then self._titleLabel.Text = tostring(text) end
@@ -1173,7 +1429,9 @@ local Prism = (function()
         if ActiveWindow == self then ActiveWindow = nil end
         for _, c in ipairs(self._conns) do pcall(function() c:Disconnect() end) end
         for _, tw in ipairs(self._loops or {}) do pcall(function() tw:Cancel() end) end
-        if self._dragStep then self._dragStep:Disconnect(); self._dragStep = nil end
+        for _, tw in ipairs(self._fxLoops or {}) do pcall(function() tw:Cancel() end) end
+        if self._cap and self._cap.step then self._cap.step:Disconnect() end
+        self._cap = nil
         if self._blur then
             local b = self._blur
             self._blur = nil
@@ -1291,7 +1549,7 @@ local Prism = (function()
         close.Activated:Connect(function() self:Destroy() end)
 
         if ks.Note and ks.Note ~= "" then
-            local note = self:_text(card, tostring(ks.Note), 13, self:_font("Normal"), "SubText")
+            local note = self:_text(card, tostring(ks.Note), 13, "Normal", "SubText")
             note.LayoutOrder = 2; note.ZIndex = 41
         end
 
@@ -1433,22 +1691,12 @@ local Prism = (function()
 
     ------------------------------------------------------------------ floating widgets
     function Window:_draggable(handle, target, isLocked)
-        local input0, start, pos, pending
         handle.InputBegan:Connect(function(i)
             if not isPress(i) or (isLocked and isLocked()) then return end
-            input0, start, pos = i, i.Position, target.Position
-        end)
-        self:_connect(UserInputService.InputChanged, function(i)
-            if not input0 then return end
-            local isMouse = input0.UserInputType == Enum.UserInputType.MouseButton1
-            if (isMouse and i.UserInputType == Enum.UserInputType.MouseMovement) or (not isMouse and i == input0) then
-                local np = UDim2.new(pos.X.Scale, pos.X.Offset + (i.Position.X - start.X), pos.Y.Scale, pos.Y.Offset + (i.Position.Y - start.Y))
-                if not pending then task.defer(function() if pending then target.Position = pending; pending = nil end end) end
-                pending = np
-            end
-        end)
-        self:_connect(UserInputService.InputEnded, function(i)
-            if input0 and (i == input0 or i.UserInputType == Enum.UserInputType.MouseButton1) then input0 = nil end
+            local start, pos = i.Position, target.Position
+            self:_capture(i, function(p)
+                target.Position = UDim2.new(pos.X.Scale, pos.X.Offset + (p.X - start.X), pos.Y.Scale, pos.Y.Offset + (p.Y - start.Y))
+            end)
         end)
     end
 
@@ -1522,7 +1770,7 @@ local Prism = (function()
         function wdg:Destroy() frame:Destroy() end
         local win = self
         function wdg:AddText(text)
-            local l = win:_text(body, tostring(text or ""), 12, win:_font("Normal"), "SubText")
+            local l = win:_text(body, tostring(text or ""), 12, "Normal", "SubText")
             l.LayoutOrder = nextOrder()
             return { Set = function(_, t) l.Text = tostring(t) end, Destroy = function() l:Destroy() end }
         end
@@ -1669,6 +1917,7 @@ local Prism = (function()
             if acc < 0.2 or not wdg.Frame.Parent then return end
             acc = 0
             local list, parts = {}, {}
+            for bi = #self._binds, 1, -1 do if not self._binds[bi].alive() then table.remove(self._binds, bi) end end
             for _, b in ipairs(self._binds) do
                 if b.alive() then
                     local k = b.key()
@@ -1736,6 +1985,87 @@ local Prism = (function()
         for _, t in ipairs(self.Tabs) do if t._setMode then t._setMode(strip) end end
         for _, g in ipairs(self._groupLabels) do if g.Parent then g.Visible = not strip end end
         if self._headerRelayout then self._headerRelayout() end
+        task.defer(function() self:_moveHighlight(false) end)
+    end
+
+    -- Tab switch reveal: a background-coloured sheet with a soft edge sweeps down off the new page,
+    -- so the top cards appear first and the rest follow, like a staggered fade-in on a website.
+    -- One frame and one gradient tween: no per-card work, no CanvasGroup.
+    function Window:_reveal()
+        if ANIM.speed <= 0 or not self._pages then return end
+        local ov, g = self._revealOverlay, self._revealGrad
+        if not ov then
+            ov = New("Frame", { Name = "Reveal", Parent = self._pages, BorderSizePixel = 0, ZIndex = 50, Visible = false,
+                Position = UDim2.fromOffset(-12, -10), Size = UDim2.new(1, 24, 1, 20) })
+            g = New("UIGradient", { Parent = ov, Rotation = 90, Transparency = NumberSequence.new({ kp(0, 1), kp(0.4, 1), kp(0.6, 0), kp(1, 0) }) })
+            self._revealOverlay, self._revealGrad = ov, g
+        end
+        ov.BackgroundColor3 = self.Theme.Background
+        ov.BackgroundTransparency = (self._glass or 0) * 0.55
+        g.Offset = Vector2.new(0, -0.6)
+        ov.Visible = true
+        self._revealToken = (self._revealToken or 0) + 1
+        local my = self._revealToken
+        local info = TweenInfo.new(0.42 / ANIM.speed, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+        TweenService:Create(g, info, { Offset = Vector2.new(0, 1) }):Play()
+        task.delay(info.Time, function() if self._revealToken == my then ov.Visible = false end end)
+    end
+
+    -- Soft fades at the top / bottom of the page area when there's more to scroll that way.
+    function Window:_updateFades(page)
+        if not self._pages or page ~= (self.ActiveTab and self.ActiveTab.Page) then return end
+        if not self._fadeTop then
+            local function mk(top)
+                local f = New("Frame", { Name = top and "FadeTop" or "FadeBottom", Parent = self._pages, BorderSizePixel = 0, ZIndex = 30,
+                    AnchorPoint = Vector2.new(0, top and 0 or 1), Position = top and UDim2.fromOffset(-12, -10) or UDim2.new(0, -12, 1, 10),
+                    Size = UDim2.new(1, 24, 0, 26), BackgroundTransparency = 1 })
+                local g = New("UIGradient", { Parent = f, Rotation = 90 })
+                self:_onTheme(f, function()
+                    f.BackgroundColor3 = self.Theme.Background
+                    local base = (self._glass or 0) * 0.55
+                    g.Transparency = top and NumberSequence.new({ kp(0, base), kp(1, 1) }) or NumberSequence.new({ kp(0, 1), kp(1, base) })
+                end)
+                return f
+            end
+            self._fadeTop, self._fadeBottom = mk(true), mk(false)
+        end
+        local maxY = page.AbsoluteCanvasSize.Y - page.AbsoluteWindowSize.Y
+        local y = page.CanvasPosition.Y
+        local wantTop, wantBottom = y > 2, maxY > 2 and y < maxY - 2
+        if wantTop ~= self._fadeTopOn then
+            self._fadeTopOn = wantTop
+            tween(self._fadeTop, { BackgroundTransparency = wantTop and 0 or 1 }, MOTION.Fast)
+        end
+        if wantBottom ~= self._fadeBottomOn then
+            self._fadeBottomOn = wantBottom
+            tween(self._fadeBottom, { BackgroundTransparency = wantBottom and 0 or 1 }, MOTION.Fast)
+        end
+    end
+
+    -- Moves the shared tab highlight onto the active tab button.
+    function Window:_moveHighlight(animate)
+        local hl, clip, list = self._tabHL, self._tabClip, self._tabList
+        if not hl then return end
+        clip.Position, clip.Size = list.Position, list.Size
+        local tab = self.ActiveTab
+        local btn = tab and tab._btn
+        if not btn or not btn.Visible or btn.AbsoluteSize.X <= 0 then hl.Visible = false return end
+        -- AbsolutePosition includes the window's UIScale; offsets inside the window don't
+        local sc = self.Holder.AbsoluteSize.X / math.max(self.Holder.Size.X.Offset, 1)
+        if sc <= 0.01 then return end
+        local rel = (btn.AbsolutePosition - clip.AbsolutePosition) / sc
+        local size = btn.AbsoluteSize / sc
+        local pos, sz = UDim2.fromOffset(math.floor(rel.X + 0.5), math.floor(rel.Y + 0.5)), UDim2.fromOffset(math.floor(size.X + 0.5), math.floor(size.Y + 0.5))
+        self._hlBar.Visible = self._layoutMode ~= "top"
+        if animate and hl.Visible and ANIM.speed > 0 then
+            self._hlGliding = (self._hlGliding or 0) + 1
+            local my = self._hlGliding
+            tween(hl, { Position = pos, Size = sz }, MOTION.Glide)
+            task.delay(MOTION.Glide.Time / math.max(ANIM.speed, 0.01), function() if self._hlGliding == my then self._hlGliding = nil end end)
+        elseif not self._hlGliding then
+            hl.Position, hl.Size = pos, sz
+        end
+        hl.Visible = true
     end
 
     function Window:SelectTab(tab)
@@ -1751,12 +2081,20 @@ local Prism = (function()
             self._crumb.TextTransparency = 1
             tween(self._crumb, { TextTransparency = 0 }, TI)
             self._crumb.Visible = not self._minimized
+            self:_fitTitleRow()
         end
+        self:_closePopup()
+        self:_paintPage(tab.Page)
+        self:_moveHighlight(true)
+        task.defer(function() self:_updateFades(tab.Page) end)
+        local first = self._revealedOnce == nil
+        self._revealedOnce = true
         for _, t in ipairs(self.Tabs) do
             if t == tab then
                 t.Page.Visible = true
-                t.Page.Position = UDim2.new(0, 10, 0, 0)
-                tween(t.Page, { Position = UDim2.new(0, 0, 0, 0) }, TI_POP)
+                t.Page.Position = UDim2.new(0, 0, 0, 10)
+                tween(t.Page, { Position = UDim2.new(0, 0, 0, 0) }, MOTION.Slow)
+                if not first then self:_reveal() end
             else
                 t.Page.Visible = false
                 t.Page.Position = UDim2.new(0, 0, 0, 0)
@@ -1783,8 +2121,40 @@ local Prism = (function()
                 if hit then counts[it.tab] = (counts[it.tab] or 0) + 1 end
             end
         end
+        -- a grouped section whose rows are all filtered out hides as a whole (no empty box)
+        local groups = {}
+        for _, it in ipairs(self._searchIndex) do
+            local par = it.card.Parent
+            if par and par:GetAttribute("PrismGroup") then groups[par] = groups[par] or it.card.Visible end
+        end
+        for g, vis in pairs(groups) do
+            if g.Parent then g.Parent.Visible = query == "" or vis end
+        end
+        local total = 0
         for _, t in ipairs(self.Tabs) do
             if t._btn then t._btn.Visible = query == "" or (counts[t] or 0) > 0 end
+            total += counts[t] or 0
+        end
+        -- empty state
+        if self._pages then
+            if not self._emptySearch then
+                local e = New("Frame", { Name = "NoResults", Parent = self._pages, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 20, Visible = false })
+                local t1 = New("TextLabel", { Parent = e, BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 0.5, -2), Size = UDim2.new(1, -40, 0, 22),
+                    Text = "No results", Font = self:_font("Bold"), TextSize = self:_ts(16), ZIndex = 20 })
+                self:_styleLabel(t1, "Bold", 16); self:_bind(t1, "TextColor3", "Text")
+                local t2 = New("TextLabel", { Parent = e, BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0.5, 4), Size = UDim2.new(1, -40, 0, 18),
+                    Text = "", Font = self:_font("Normal"), TextSize = self:_ts(12), TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 20 })
+                self:_styleLabel(t2, "Normal", 12); self:_bind(t2, "TextColor3", "SubText")
+                self._emptySearch, self._emptySearchText = e, t2
+            end
+            local none = query ~= "" and total == 0
+            self._emptySearch.Visible = none
+            if none then
+                self._emptySearchText.Text = "Nothing matches \"" .. query .. "\". Try a shorter word."
+                if self.ActiveTab then self.ActiveTab.Page.Visible = false end
+            elseif self.ActiveTab then
+                self.ActiveTab.Page.Visible = true
+            end
         end
         if query ~= "" and self.ActiveTab and (counts[self.ActiveTab] or 0) == 0 then
             for _, t in ipairs(self.Tabs) do
@@ -1816,9 +2186,9 @@ local Prism = (function()
         self:_stroke(card, "Stroke")
         pad(card, 16)
         New("UIListLayout", { Parent = card, Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder })
-        self:_text(card, cfg.Title or "Confirm", 16, self:_font("Bold"), "Text").LayoutOrder = 1
+        self:_text(card, cfg.Title or "Confirm", 16, "Bold", "Text").LayoutOrder = 1
         local msg = cfg.Message or cfg.Content
-        if msg and msg ~= "" then self:_text(card, tostring(msg), 13, self:_font("Normal"), "SubText").LayoutOrder = 2 end
+        if msg and msg ~= "" then self:_text(card, tostring(msg), 13, "Normal", "SubText").LayoutOrder = 2 end
         local row = New("Frame", { Parent = card, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 32), LayoutOrder = 3 })
         New("UIListLayout", {
             Parent = row, FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Right,
@@ -1962,7 +2332,7 @@ local Prism = (function()
         local msgH = 0
         if hasMsg then
             local ok, size = pcall(function()
-                return TextService:GetTextSize(message, bodySize, Enum.Font.Gotham, Vector2.new(textW, 1000))
+                return TextService:GetTextSize(message, bodySize, self:_font("Normal"), Vector2.new(textW, 1000))
             end)
             msgH = (ok and size and size.Y or 16) + 2
             msgH = math.max(msgH, 16)
@@ -2017,20 +2387,24 @@ local Prism = (function()
             })
         end
 
-        New("TextLabel", {
+        local titleLabel = New("TextLabel", {
             Parent = card, Position = UDim2.fromOffset(textX, hasMsg and 14 or (height / 2 - 9)),
             Size = UDim2.fromOffset(textW, 18), BackgroundTransparency = 1,
             Text = title, Font = self:_font("Bold"), TextSize = titleSize,
             TextColor3 = th.Text, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
         })
+        self:_styleLabel(titleLabel, "Bold", titleSize)
+        titleLabel.TextSize = titleSize -- toasts keep their own size; only the font follows SetFont
         if hasMsg then
-            New("TextLabel", {
+            local msgLabel = New("TextLabel", {
                 Parent = card, Position = UDim2.fromOffset(textX, 36),
                 Size = UDim2.fromOffset(textW, msgH), BackgroundTransparency = 1,
                 Text = message, Font = self:_font("Normal"), TextSize = bodySize,
                 TextColor3 = th.SubText, TextXAlignment = Enum.TextXAlignment.Left,
                 TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
             })
+            self:_styleLabel(msgLabel, "Normal", bodySize)
+            msgLabel.TextSize = bodySize
         end
 
         local n = { card = card, height = height, dismissed = false }
@@ -2081,23 +2455,19 @@ local Prism = (function()
             if input.UserInputType == Enum.UserInputType.Touch then
                 touchStart, swiped = input.Position, false
                 setPaused(true)
+                self:_capture(input, function(p)
+                    if n.dismissed or swiped or not touchStart then return end
+                    if p.X - touchStart.X > 55 and math.abs(p.Y - touchStart.Y) < 40 then
+                        swiped = true
+                        self:_dismissNotif(n)
+                    end
+                end)
             end
         end)
         card.InputEnded:Connect(function(input)
             if input.UserInputType == Enum.UserInputType.Touch then
                 touchStart = nil
                 if not swiped then setPaused(false) end
-            end
-        end)
-        self:_connect(UserInputService.InputChanged, function(input)
-            if n.dismissed or not touchStart then return end
-            if input.UserInputType == Enum.UserInputType.Touch then
-                local dx = input.Position.X - touchStart.X
-                local dy = math.abs(input.Position.Y - touchStart.Y)
-                if dx > 55 and dy < 40 then
-                    swiped = true
-                    self:_dismissNotif(n)
-                end
             end
         end)
 
@@ -2124,12 +2494,6 @@ local Prism = (function()
             Text = cfg.Title or "Tab", Font = self:_font("Medium"), TextSize = self:_ts(13), TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
         })
         self:_styleLabel(label, "Medium", 13)
-        local indicator = New("Frame", {
-            Parent = btn, AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 0, 0.5, 0),
-            Size = UDim2.fromOffset(3, 0), BorderSizePixel = 0, BackgroundColor3 = Color3.new(1, 1, 1), ZIndex = 2,
-        })
-        New("UICorner", { Parent = indicator, CornerRadius = UDim.new(1, 0) })
-        self:_gradient(indicator, 40, 90)
         local icon
         if iconImage then
             icon = New("ImageLabel", {
@@ -2167,6 +2531,7 @@ local Prism = (function()
                 label.Size = UDim2.new(0, 0, 1, 0)
                 btnPad.PaddingRight = UDim.new(0, 12)
                 if badge then badge.Visible = false end
+                if tab._titleFrame then tab._titleFrame.Visible = false end
             else
                 btn.AutomaticSize = Enum.AutomaticSize.None
                 btn.Size = UDim2.new(1, 0, 0, BH)
@@ -2174,6 +2539,7 @@ local Prism = (function()
                 label.Size = UDim2.new(1, -(textX + (badge and 36 or 6)), 1, 0)
                 btnPad.PaddingRight = UDim.new(0, 0)
                 if badge then badge.Visible = true end
+                if tab._titleFrame then tab._titleFrame.Visible = true end
             end
         end
         tab._setMode(self._layoutMode == "top")
@@ -2181,10 +2547,9 @@ local Prism = (function()
         tab._paint = function()
             local active = self.ActiveTab == tab
             local th = self.Theme
-            tween(btn, { BackgroundColor3 = th.Elevated:Lerp(th.Accent, 0.12), BackgroundTransparency = active and 0 or 1 }, TI)
+            btn.BackgroundColor3 = th.Elevated
+            tween(btn, { BackgroundTransparency = 1 }, MOTION.Fast)
             tween(label, { TextColor3 = active and th.Text or th.SubText }, TI)
-            local strip = self._layoutMode == "top"
-            tween(indicator, { Size = UDim2.fromOffset(3, (active and not strip) and math.floor(BH * 0.5) or 0) }, TI_POP)
             label.Font = self:_font(active and "Bold" or "Medium")
             if icon then tween(icon, { ImageColor3 = active and th.Accent or th.SubText }, TI) end
         end
@@ -2192,13 +2557,20 @@ local Prism = (function()
 
         btn.MouseEnter:Connect(function()
             if self._touch or self.ActiveTab == tab then return end
-            tween(btn, { BackgroundTransparency = 0.6 })
-            tween(label, { TextColor3 = self.Theme.Text })
+            tween(btn, { BackgroundTransparency = 0.65 }, MOTION.Fast)
+            tween(label, { TextColor3 = self.Theme.Text }, MOTION.Fast)
         end)
         btn.MouseLeave:Connect(function()
             if self._touch or self.ActiveTab == tab then return end
-            tween(btn, { BackgroundTransparency = 1 })
-            tween(label, { TextColor3 = self.Theme.SubText })
+            tween(btn, { BackgroundTransparency = 1 }, MOTION.Fast)
+            tween(label, { TextColor3 = self.Theme.SubText }, MOTION.Fast)
+        end)
+        -- keep the shared highlight glued to the active button through scrolling, resizing, search, dragging
+        btn:GetPropertyChangedSignal("AbsolutePosition"):Connect(function()
+            if self.ActiveTab == tab then self:_moveHighlight(false) end
+        end)
+        btn:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            if self.ActiveTab == tab then self:_moveHighlight(false) end
         end)
         btn.MouseButton1Click:Connect(function() self:SelectTab(tab) end)
 
@@ -2210,6 +2582,21 @@ local Prism = (function()
         pad(page, 2, 6, 2, 2)
         New("UIListLayout", { Parent = page, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder })
         tab.Page = page
+        if self._pageTitles then
+            local head = New("Frame", { Name = "PageTitle", Parent = page, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = -1 })
+            New("UIListLayout", { Parent = head, Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder })
+            pad(head, 4, 4, 6, 4)
+            local tl = self:_text(head, cfg.Title or "Tab", 20, "Bold", "Text")
+            tl.LayoutOrder = 1
+            if cfg.Description and cfg.Description ~= "" then
+                self:_text(head, cfg.Description, 12, "Normal", "SubText").LayoutOrder = 2
+            end
+            head.Visible = self._layoutMode ~= "top"
+            tab._titleFrame = head
+        end
+        page:GetPropertyChangedSignal("CanvasPosition"):Connect(function() self:_updateFades(page) end)
+        page:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(function() self:_updateFades(page) end)
+        page:GetPropertyChangedSignal("AbsoluteWindowSize"):Connect(function() self:_updateFades(page) end)
 
         table.insert(self.Tabs, tab)
         if #self.Tabs == 1 then self:SelectTab(tab) end
@@ -2218,7 +2605,7 @@ local Prism = (function()
 
     function Window:AddTabGroup(title)
         self._navOrder = (self._navOrder or 0) + 1
-        local label = self:_text(self._tabList, string.upper(tostring(title or "GROUP")), 9, self:_font("Bold"), "SubText")
+        local label = self:_text(self._tabList, string.upper(tostring(title or "GROUP")), 9, "Bold", "SubText")
         label.Size = UDim2.new(1, 0, 0, 16)
         label.LayoutOrder = self._navOrder
         pad(label, 8, 0, 0, 8)
@@ -2401,23 +2788,47 @@ local Prism = (function()
     function Tab:_card(cfg, ctrlW, class, parent)
         local w = self.Window
         parent = parent or self:_host()
+        -- inside a grouped section, cards are rows: no box of their own, a hairline between rows,
+        -- and an inset rounded highlight on hover (the section draws the surrounding card)
+        local grouped = parent:GetAttribute("PrismGroup") == true
+        local divider
+        if grouped then
+            local rows = parent:GetAttribute("PrismRows") or 0
+            if rows > 0 then
+                divider = New("Frame", { Name = "RowDivider", Parent = parent, Size = UDim2.new(1, -24, 0, 1), BorderSizePixel = 0, LayoutOrder = self:_next() })
+                w:_bind(divider, "BackgroundColor3", "Stroke")
+                divider.BackgroundTransparency = 0.45
+            end
+            parent:SetAttribute("PrismRows", rows + 1)
+        end
         local card = New(class or "Frame", { Parent = parent, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BorderSizePixel = 0, LayoutOrder = self:_next() })
         if class == "TextButton" then card.Text = ""; card.AutoButtonColor = false end
-        w:_bind(card, "BackgroundColor3", "Surface")
-        w:_glassify(card, 0.35)
-        w:_corner(card, 0.8)
-        w:_edge(card, { flat = { key = "Stroke", t = 0.7 } })
+        if grouped then
+            card:SetAttribute("PrismRow", true)
+            card.BackgroundTransparency = 1
+            w:_bind(card, "BackgroundColor3", "Elevated")
+            w:_corner(card, 0.55)
+            if divider then
+                card:GetPropertyChangedSignal("Visible"):Connect(function() divider.Visible = card.Visible end)
+                card.Destroying:Connect(function() divider:Destroy() end)
+            end
+        else
+            w:_bind(card, "BackgroundColor3", "Surface")
+            w:_glassify(card, 0.35)
+            w:_corner(card, 0.8)
+            w:_edge(card, { flat = { key = "Stroke", t = 0.7 } })
+        end
         pad(card, w._d.cardPad, 14)
         local layout = New("UIListLayout", { Parent = card, Padding = UDim.new(0, w._d.gap), SortOrder = Enum.SortOrder.LayoutOrder })
-        table.insert(w._densityRegs, { fn = function(d) layout.Padding = UDim.new(0, d.gap) end })
+        table.insert(w._densityRegs, { inst = layout, fn = function(d) layout.Padding = UDim.new(0, d.gap) end })
 
         local header = New("Frame", { Name = "Header", Parent = card, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, w._d.headerH), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 1 })
         local texts = New("Frame", { Parent = header, BackgroundTransparency = 1, Size = UDim2.new(1, ctrlW > 0 and -(ctrlW + 10) or 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y })
         New("UIListLayout", { Parent = texts, Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder })
         local hasDesc = cfg.Description and cfg.Description ~= ""
         if not hasDesc then pad(texts, 3, 0, 0, 0) end
-        w:_text(texts, cfg.Title or cfg.Text or "", 14, w:_font("Medium"), "Text").LayoutOrder = 1
-        if hasDesc then w:_text(texts, cfg.Description, 12, w:_font("Normal"), "SubText").LayoutOrder = 2 end
+        w:_text(texts, cfg.Title or cfg.Text or "", 14, "Medium", "Text").LayoutOrder = 1
+        if hasDesc then w:_text(texts, cfg.Description, 12, "Normal", "SubText").LayoutOrder = 2 end
         if cfg.Badge ~= nil and cfg.Badge ~= "" then
             local pill = New("Frame", { Parent = texts, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 15), BorderSizePixel = 0, LayoutOrder = 3 })
             w:_corner(pill, "pill")
@@ -2443,28 +2854,47 @@ local Prism = (function()
     function Tab:_hover(card)
         local w = self.Window
         local hovered = false
-        local st = card:FindFirstChild("HoverStroke")
+        local st = card:FindFirstChild("Edge")
+        local function flatEdge() return st and st.Enabled and not w._bevel and not w._liquid end
+        local row = card:GetAttribute("PrismRow") == true
         card.MouseEnter:Connect(function()
             if w._touch then return end
             hovered = true
-            tween(card, { BackgroundColor3 = w.Theme.Elevated }, TI)
-            if st then tween(st, { Color = w.Theme.Accent, Transparency = 0.45 }, TI) end
+            if row then
+                tween(card, { BackgroundTransparency = 0.45 }, MOTION.Fast)
+            else
+                tween(card, { BackgroundColor3 = w.Theme.Surface:Lerp(w.Theme.Elevated, 0.7) }, MOTION.Fast)
+                if flatEdge() then tween(st, { Color = w.Theme.Stroke:Lerp(w.Theme.Accent, 0.55), Transparency = 0.35 }, MOTION.Fast) end
+            end
         end)
         card.MouseLeave:Connect(function()
             hovered = false
-            tween(card, { BackgroundColor3 = w.Theme.Surface }, TI)
-            if st then tween(st, { Color = w.Theme.Stroke, Transparency = 0.65 }, TI) end
+            if row then
+                tween(card, { BackgroundTransparency = 1 }, TI)
+            else
+                tween(card, { BackgroundColor3 = w.Theme.Surface }, TI)
+                if flatEdge() then tween(st, { Color = w.Theme.Stroke, Transparency = 0.7 }, TI) end
+            end
         end)
         local press = New("UIScale", { Parent = card })
         card.InputBegan:Connect(function(input)
             if isPress(input) then
-                tween(card, { BackgroundColor3 = w.Theme.Elevated }, TweenInfo.new(0.07))
+                if row then
+                    tween(card, { BackgroundTransparency = 0.2 }, TweenInfo.new(0.07))
+                else
+                    tween(card, { BackgroundColor3 = w.Theme.Elevated }, TweenInfo.new(0.07))
+                end
                 tween(press, { Scale = 0.985 }, TweenInfo.new(0.08))
+                w:_ripple(card, input)
             end
         end)
         card.InputEnded:Connect(function(input)
             if isPress(input) then
-                tween(card, { BackgroundColor3 = hovered and w.Theme.Elevated or w.Theme.Surface }, TI)
+                if row then
+                    tween(card, { BackgroundTransparency = hovered and 0.45 or 1 }, TI)
+                else
+                    tween(card, { BackgroundColor3 = hovered and w.Theme.Surface:Lerp(w.Theme.Elevated, 0.7) or w.Theme.Surface }, TI)
+                end
                 tween(press, { Scale = 1 }, TI_POP)
             end
         end)
@@ -2480,11 +2910,19 @@ local Prism = (function()
     -- Returns fn(on?) -> bool. Passing a boolean dims the card's text and sets the state.
     function Tab:_disabler(card)
         local state = false
+        local texts
+        card.DescendantAdded:Connect(function() texts = nil end)
         return function(on)
-            if on ~= nil then
+            if on ~= nil and (on == true) ~= state then
                 state = on == true
-                for _, d in ipairs(card:GetDescendants()) do
-                    if d:IsA("TextLabel") or d:IsA("TextButton") then d.TextTransparency = state and 0.6 or 0 end
+                if not texts then
+                    texts = {}
+                    for _, d in ipairs(card:GetDescendants()) do
+                        if d:IsA("TextLabel") or d:IsA("TextButton") then table.insert(texts, d) end
+                    end
+                end
+                for _, d in ipairs(texts) do
+                    if d.Parent then d.TextTransparency = state and 0.6 or 0 end
                 end
             end
             return state
@@ -2494,12 +2932,14 @@ local Prism = (function()
     -- Collapsible section. Returns { Toggle(), Set(open), Get(), SetTitle(text) }.
     function Tab:AddSection(name)
         local w = self.Window
+        -- a column (from AddColumns) keeps its sections inside the column, not on the whole page
+        local base = self.Frame or self.Page
         self._sectionStack = {}
 
-        local wrap = New("Frame", { Parent = self.Page, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = self:_next() })
-        New("UIListLayout", { Parent = wrap, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder })
+        local wrap = New("Frame", { Parent = base, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = self:_next() })
+        New("UIListLayout", { Parent = wrap, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder })
         -- breathing room above every section except the first thing on the page
-        if self._order > 1 then pad(wrap, 8, 0, 0, 0) end
+        if self._order > 1 then pad(wrap, 10, 0, 0, 0) end
         local header = New("TextButton", { Parent = wrap, Text = "", AutoButtonColor = false, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 22), LayoutOrder = 1 })
         local label = New("TextLabel", {
             Parent = header, BackgroundTransparency = 1, Position = UDim2.fromOffset(4, 0), Size = UDim2.new(1, -30, 1, 0),
@@ -2524,8 +2964,20 @@ local Prism = (function()
 
         -- Plain Frame: CanvasGroup does not reliably support AutomaticSize.
         local body = New("Frame", { Parent = wrap, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2 })
-        local bodyLayout = New("UIListLayout", { Parent = body, Padding = UDim.new(0, w._d.gap), SortOrder = Enum.SortOrder.LayoutOrder })
-        table.insert(w._densityRegs, { fn = function(d) bodyLayout.Padding = UDim.new(0, d.gap) end })
+        if w._grouped ~= false then
+            -- grouped settings: the section is one rounded card, its widgets are rows inside it
+            body:SetAttribute("PrismGroup", true)
+            body.BorderSizePixel = 0
+            w:_bind(body, "BackgroundColor3", "Surface")
+            w:_glassify(body, 0.35)
+            w:_corner(body, 0.8)
+            w:_edge(body, { flat = { key = "Stroke", t = 0.7 } })
+            pad(body, 4, 4, 4, 4)
+            New("UIListLayout", { Parent = body, Padding = UDim.new(0, 0), SortOrder = Enum.SortOrder.LayoutOrder, HorizontalAlignment = Enum.HorizontalAlignment.Center })
+        else
+            local bodyLayout = New("UIListLayout", { Parent = body, Padding = UDim.new(0, w._d.gap), SortOrder = Enum.SortOrder.LayoutOrder })
+            table.insert(w._densityRegs, { inst = bodyLayout, fn = function(d) bodyLayout.Padding = UDim.new(0, d.gap) end })
+        end
 
         local sec = { open = true, body = body }
         function sec:Set(open)
@@ -2672,11 +3124,12 @@ local Prism = (function()
             local th, on = w.Theme, obj.Value
             local inset = (tth - tk) / 2
             local goals = {
-                { track, { BackgroundColor3 = on and th.Accent or th.Stroke } },
-                { thumb, { BackgroundColor3 = on and th.AccentText or Color3.new(1, 1, 1), Position = on and UDim2.new(1, -(tk + inset), 0.5, 0) or UDim2.new(0, inset, 0.5, 0) } },
+                { track, { BackgroundColor3 = on and th.Accent or th.Stroke }, TI },
+                { thumb, { BackgroundColor3 = on and th.AccentText or Color3.new(1, 1, 1) }, TI },
+                { thumb, { Position = on and UDim2.new(1, -(tk + inset), 0.5, 0) or UDim2.new(0, inset, 0.5, 0) }, MOTION.Snap },
             }
             for _, g in ipairs(goals) do
-                if animate then tween(g[1], g[2]) else for k, v in pairs(g[2]) do g[1][k] = v end end
+                if animate then tween(g[1], g[2], g[3]) else for k, v in pairs(g[2]) do g[1][k] = v end end
             end
         end
         w:_onTheme(track, function() paint(false) end)
@@ -2753,6 +3206,22 @@ local Prism = (function()
         w:_corner(knob, "pill")
         w:_stroke(knob, "Accent", 2)
 
+        -- value bubble above the knob while dragging
+        local bubble = New("TextLabel", {
+            Parent = knob, AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 0, -6), Size = UDim2.fromOffset(0, 20),
+            AutomaticSize = Enum.AutomaticSize.X, BorderSizePixel = 0, Text = "", Font = w:_font("Bold"), TextSize = w:_ts(11),
+            BackgroundTransparency = 1, TextTransparency = 1, ZIndex = 5,
+        })
+        w:_styleLabel(bubble, "Bold", 11)
+        w:_corner(bubble, 0.5)
+        pad(bubble, 0, 7, 0, 7)
+        w:_onTheme(bubble, function() bubble.BackgroundColor3 = w.Theme.Accent; bubble.TextColor3 = w.Theme.AccentText end)
+        local bubbleScale = New("UIScale", { Parent = bubble, Scale = 0.6 })
+        local function showBubble(on)
+            tween(bubble, { BackgroundTransparency = on and 0 or 1, TextTransparency = on and 0 or 1 }, MOTION.Fast)
+            tween(bubbleScale, { Scale = on and 1 or 0.6 }, on and MOTION.Spring or MOTION.Fast)
+        end
+
         local obj = { Value = min }
         local function set(v, silent)
             v = math.clamp(min + math.floor((v - min) / inc + 0.5) * inc, min, max)
@@ -2762,25 +3231,23 @@ local Prism = (function()
             fill.Size = UDim2.new(a, 0, 1, 0)
             knob.Position = UDim2.new(a, 0, 0.5, 0)
             valueLabel.Text = formatNumber(v) .. (cfg.Suffix or "")
+            bubble.Text = valueLabel.Text
             if not silent then safe(cfg.Callback, v) end
         end
         local function fromX(x) set(min + (max - min) * math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)) end
 
-        local dragging = false
+        local page = self.Page
         hit.InputBegan:Connect(function(i)
-            if isPress(i) then
-                dragging = true; fromX(i.Position.X)
-                self.Page.ScrollingEnabled = false -- keep the page still while dragging on touch
-                tween(knob, { Size = UDim2.fromOffset(ks + 4, ks + 4) }, TweenInfo.new(0.1))
-            end
-        end)
-        w:_connect(UserInputService.InputChanged, function(i) if dragging and isMove(i) then fromX(i.Position.X) end end)
-        w:_connect(UserInputService.InputEnded, function(i)
-            if isPress(i) and dragging then
-                dragging = false
-                self.Page.ScrollingEnabled = true
-                tween(knob, { Size = UDim2.fromOffset(ks, ks) }, TI)
-            end
+            if not isPress(i) then return end
+            fromX(i.Position.X)
+            page.ScrollingEnabled = false -- keep the page still while dragging on touch
+            tween(knob, { Size = UDim2.fromOffset(ks + 4, ks + 4) }, MOTION.Fast)
+            showBubble(true)
+            w:_capture(i, function(p) fromX(p.X) end, function()
+                page.ScrollingEnabled = true
+                tween(knob, { Size = UDim2.fromOffset(ks, ks) }, MOTION.Spring)
+                showBubble(false)
+            end)
         end)
         w:_tooltip(valueLabel, "Click to type an exact value")
         valueLabel.FocusLost:Connect(function()
@@ -2810,20 +3277,31 @@ local Prism = (function()
         w:_styleLabel(arrow, "Bold", 13)
         w:_bind(arrow, "TextColor3", "SubText")
 
+        -- popover: floats above the page (on the window's popup layer) instead of growing the card
+        local pop = New("Frame", { Name = "DropdownMenu", Parent = w:_popupLayer(), Visible = false, BorderSizePixel = 0, ClipsDescendants = true, ZIndex = 60 })
+        w:_corner(pop, 0.7)
+        w:_bind(pop, "BackgroundColor3", "Surface")
+        w:_edge(pop, { flat = { key = "Stroke", t = 0.3 } })
+        pad(pop, 6, 6, 6, 6)
+        New("UIListLayout", { Parent = pop, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder })
+        local popScale = New("UIScale", { Parent = pop })
+        card.Destroying:Connect(function() pop:Destroy() end)
+
         -- search field, shown when the list is long
         local searchBox = New("TextBox", {
-            Parent = card, Visible = false, Size = UDim2.new(1, 0, 0, 26), Text = "", PlaceholderText = "Search...",
+            Parent = pop, Visible = false, Size = UDim2.new(1, 0, 0, 26), Text = "", PlaceholderText = "Search...",
             Font = w:_font("Normal"), TextSize = w:_ts(12), TextXAlignment = Enum.TextXAlignment.Left,
-            ClearTextOnFocus = false, LayoutOrder = 2, BorderSizePixel = 0, ClipsDescendants = true,
+            ClearTextOnFocus = false, LayoutOrder = 1, BorderSizePixel = 0, ClipsDescendants = true, ZIndex = 61,
         })
         w:_styleLabel(searchBox, "Normal", 12)
         pad(searchBox, 0, 9, 0, 9)
         w:_corner(searchBox, 0.4)
         w:_bind(searchBox, "BackgroundColor3", "Elevated"); w:_bind(searchBox, "TextColor3", "Text"); w:_bind(searchBox, "PlaceholderColor3", "SubText")
+        w:_focusRing(searchBox)
 
-        local list = New("ScrollingFrame", { Parent = card, Visible = false, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 0), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3, LayoutOrder = 3 })
+        local list = New("ScrollingFrame", { Parent = pop, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 0), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3, LayoutOrder = 2, ZIndex = 61 })
         w:_bind(list, "ScrollBarImageColor3", "Stroke")
-        New("UIListLayout", { Parent = list, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder })
+        New("UIListLayout", { Parent = list, Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder })
 
         local obj, painters = {}, {}
         local filter = ""
@@ -2850,23 +3328,58 @@ local Prism = (function()
             end
             return math.min(math.max(n, 1) * (w._touch and 40 or 32), w._touch and 200 or 160)
         end
-        local openToken = 0
+        local openToken, isOpen, scrollConn = 0, false, nil
+        local tab = self
+        local function popHeight()
+            return listHeight() + (searchBox.Visible and 30 or 0) + 12
+        end
         local function setOpen(open)
+            if open == isOpen then return end
+            isOpen = open
             openToken += 1
             local token = openToken
             tween(arrow, { Rotation = open and 270 or 90 }, TI)
             if open then
-                list.Visible = true
+                w:_openPopup({ frame = pop, anchor = box, close = function() setOpen(false) end })
                 searchBox.Visible = #values > 7
-                tween(list, { Size = UDim2.new(1, 0, 0, listHeight()) }, TI)
+                list.Size = UDim2.new(1, 0, 0, listHeight())
+                -- place under the box (right edges aligned), or above it if there's no room below
+                local layer = pop.Parent
+                local sc = w:_uiScale()
+                local rel = (box.AbsolutePosition - layer.AbsolutePosition) / sc
+                local bs = box.AbsoluteSize / sc
+                local ls = layer.AbsoluteSize / sc
+                local width = math.max(bs.X, 180)
+                local h = popHeight()
+                local x = math.clamp(rel.X + bs.X - width, 4, math.max(4, ls.X - width - 4))
+                local below = rel.Y + bs.Y + 6
+                local above = rel.Y - h - 6
+                local useAbove = below + h > ls.Y - 4 and above > 4
+                pop.AnchorPoint = Vector2.new(0, useAbove and 1 or 0)
+                pop.Position = UDim2.fromOffset(x, useAbove and (rel.Y - 6) or below)
+                pop.Size = UDim2.fromOffset(width, 0)
+                pop.Visible = true
+                popScale.Scale = 0.96
+                tween(pop, { Size = UDim2.fromOffset(width, h) }, MOTION.Base)
+                tween(popScale, { Scale = 1 }, MOTION.Base)
+                -- scrolling the page would leave the menu floating in the wrong place, so close it
+                if scrollConn then scrollConn:Disconnect() end
+                scrollConn = tab.Page:GetPropertyChangedSignal("CanvasPosition"):Connect(function() setOpen(false) end)
             else
-                searchBox.Visible = false
+                if scrollConn then scrollConn:Disconnect(); scrollConn = nil end
+                if w._popup and w._popup.frame == pop then w._popup = nil end
                 if searchBox.Text ~= "" then searchBox.Text = "" end
-                tween(list, { Size = UDim2.new(1, 0, 0, 0) }, TI)
-                task.delay(0.18, function()
-                    if token == openToken and list.Parent then list.Visible = false end
+                tween(pop, { Size = UDim2.fromOffset(pop.Size.X.Offset, 0) }, MOTION.Fast)
+                tween(popScale, { Scale = 0.97 }, MOTION.Fast)
+                task.delay(MOTION.Fast.Time / math.max(ANIM.speed, 0.01) + 0.02, function()
+                    if token == openToken and pop.Parent then pop.Visible = false end
                 end)
             end
+        end
+        local function resizePop()
+            if not isOpen then return end
+            tween(list, { Size = UDim2.new(1, 0, 0, listHeight()) }, TI)
+            tween(pop, { Size = UDim2.fromOffset(pop.Size.X.Offset, popHeight()) }, TI)
         end
         local function choose(val, silent)
             if multi then selected[val] = not selected[val] or nil else value = val; setOpen(false) end
@@ -2878,7 +3391,7 @@ local Prism = (function()
             painters = {}
             filter = ""
             for i, val in ipairs(values) do
-                local b = New("TextButton", { Name = tostring(val), Parent = list, Size = UDim2.new(1, -6, 0, w._touch and 36 or 28), Text = "", Font = w:_font("Medium"), TextSize = w:_ts(13), AutoButtonColor = false, BorderSizePixel = 0, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = i, ClipsDescendants = true })
+                local b = New("TextButton", { Name = tostring(val), Parent = list, ZIndex = 61, Size = UDim2.new(1, -6, 0, w._touch and 36 or 28), Text = "", Font = w:_font("Medium"), TextSize = w:_ts(13), AutoButtonColor = false, BorderSizePixel = 0, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = i, ClipsDescendants = true })
                 w:_styleLabel(b, "Medium", 13)
                 local swatchColor = type(cfg.Swatch) == "table" and cfg.Swatch[val] or nil
                 local textPad = 10
@@ -2906,19 +3419,23 @@ local Prism = (function()
                 b.MouseLeave:Connect(function() paint() end)
                 b.MouseButton1Click:Connect(function() choose(val) end)
             end
-            if list.Visible then
-                tween(list, { Size = UDim2.new(1, 0, 0, listHeight()) }, TI)
-            else
-                list.Size = UDim2.new(1, 0, 0, 0)
-            end
+            resizePop()
             display()
         end
+        local noMatch = New("TextLabel", { Parent = list, BackgroundTransparency = 1, Size = UDim2.new(1, -6, 0, w._touch and 36 or 28), Text = "No matches",
+            Font = w:_font("Medium"), TextSize = w:_ts(12), Visible = false, LayoutOrder = 100000, ZIndex = 61 })
+        w:_styleLabel(noMatch, "Medium", 12); w:_bind(noMatch, "TextColor3", "SubText")
         searchBox:GetPropertyChangedSignal("Text"):Connect(function()
             filter = searchBox.Text:lower()
+            local shown = 0
             for _, c in ipairs(list:GetChildren()) do
-                if c:IsA("TextButton") then c.Visible = filter == "" or c.Name:lower():find(filter, 1, true) ~= nil end
+                if c:IsA("TextButton") then
+                    c.Visible = filter == "" or c.Name:lower():find(filter, 1, true) ~= nil
+                    if c.Visible then shown += 1 end
+                end
             end
-            if list.Visible then tween(list, { Size = UDim2.new(1, 0, 0, listHeight()) }, TI) end
+            noMatch.Visible = shown == 0
+            resizePop()
         end)
         function obj:SetValues(v) values = v; rebuild() end
         function obj:Set(v)
@@ -2932,7 +3449,7 @@ local Prism = (function()
             end
             display(); repaint(); safe(cfg.Callback, obj:Get())
         end
-        box.MouseButton1Click:Connect(function() setOpen(not list.Visible) end)
+        box.MouseButton1Click:Connect(function() setOpen(not isOpen) end)
         rebuild()
         return self:_registerState(cfg, obj)
     end
@@ -3292,8 +3809,9 @@ local Prism = (function()
         end
 
         -- dragging (mouse + touch); the page stops scrolling while you drag
-        local dragKind, dragInput = nil, nil
         local function apply(kind, pos)
+            -- input positions exclude the top bar inset, AbsolutePosition here includes it
+            pos = Vector2.new(pos.X, pos.Y + GuiService:GetGuiInset().Y)
             if kind == "sv" then
                 local ap, as = sv.AbsolutePosition, sv.AbsoluteSize
                 s = math.clamp((pos.X - ap.X) / math.max(as.X, 1), 0, 1)
@@ -3310,34 +3828,20 @@ local Prism = (function()
             local cursor = kind == "sv" and svCursor or (kind == "hue" and hueCursor or alphaCursor)
             target.InputBegan:Connect(function(i)
                 if not isPress(i) then return end
-                dragKind, dragInput = kind, i
                 tab.Page.ScrollingEnabled = false
-                local sz = cursor.Size.X.Offset
-                tween(cursor, { Size = UDim2.fromOffset(sz + 4, sz + 4) }, TweenInfo.new(0.08))
+                local base = kind == "sv" and (touch and 18 or 14) or (barH + 6)
+                tween(cursor, { Size = UDim2.fromOffset(base + 4, base + 4) }, TweenInfo.new(0.08))
                 apply(kind, i.Position)
+                w:_capture(i, function(p) apply(kind, p) end, function()
+                    tween(cursor, { Size = UDim2.fromOffset(base, base) }, TI_POP)
+                    tab.Page.ScrollingEnabled = true
+                    commit()
+                end)
             end)
         end
         draggable("sv", sv)
         draggable("hue", hue)
         if alphaBar then draggable("alpha", alphaBar) end
-        w:_connect(UserInputService.InputChanged, function(i)
-            if not dragKind then return end
-            local isMouse = dragInput.UserInputType == Enum.UserInputType.MouseButton1
-            if (isMouse and i.UserInputType == Enum.UserInputType.MouseMovement) or (not isMouse and i == dragInput) then
-                apply(dragKind, i.Position)
-            end
-        end)
-        w:_connect(UserInputService.InputEnded, function(i)
-            if dragKind and (i == dragInput or i.UserInputType == Enum.UserInputType.MouseButton1) then
-                local cursor = dragKind == "sv" and svCursor or (dragKind == "hue" and hueCursor or alphaCursor)
-                local base = dragKind == "sv" and (touch and 18 or 14) or (barH + 6)
-                tween(cursor, { Size = UDim2.fromOffset(base, base) }, TI_POP)
-                dragKind, dragInput = nil, nil
-                tab.Page.ScrollingEnabled = true
-                commit()
-            end
-        end)
-
         -- typed input
         hexBox.FocusLost:Connect(function()
             local hex = hexBox.Text:gsub("[^%x]", "")
@@ -3479,6 +3983,7 @@ local Prism = (function()
         w:_styleLabel(minus, "Bold", 16)
         w:_corner(minus, 0.4); w:_bind(minus, "BackgroundColor3", "Elevated"); w:_bind(minus, "TextColor3", "Text")
         local box = New("TextBox", { Parent = row, Position = UDim2.fromOffset(30, 0), Size = UDim2.fromOffset(60, 26), Text = tostring(value), Font = w:_font("Medium"), TextSize = w:_ts(13), ClearTextOnFocus = false })
+        w:_focusRing(box)
         w:_styleLabel(box, "Medium", 13)
         w:_corner(box, 0.4); w:_bind(box, "BackgroundColor3", "Elevated"); w:_bind(box, "TextColor3", "Text")
         local plus = New("TextButton", { Parent = row, Position = UDim2.fromOffset(94, 0), Size = UDim2.fromOffset(26, 26), Text = "+", Font = w:_font("Bold"), TextSize = w:_ts(16), AutoButtonColor = false })
@@ -3512,6 +4017,7 @@ local Prism = (function()
             w:_styleLabel(lbl, "Medium", 12)
             w:_bind(lbl, "TextColor3", "SubText")
             local box = New("TextBox", { Parent = row, Position = UDim2.new(0.4, 0, 0, 0), Size = UDim2.new(0.6, 0, 1, 0), Text = spec.Default or "", PlaceholderText = spec.Placeholder or "", Font = w:_font("Normal"), TextSize = w:_ts(12), ClearTextOnFocus = false })
+            w:_focusRing(box)
             w:_styleLabel(box, "Normal", 12)
             pad(box, 0, 8, 0, 8)
             w:_corner(box, 0.4)
@@ -3540,6 +4046,7 @@ local Prism = (function()
         local w = self.Window
         local card = self:_card({ Title = cfg.Title or "Search", Description = cfg.Description, Tooltip = cfg.Tooltip }, 0)
         local box = New("TextBox", { Parent = card, Size = UDim2.new(1, 0, 0, 28), Text = "", PlaceholderText = cfg.Placeholder or "Search...", Font = w:_font("Normal"), TextSize = w:_ts(12), ClearTextOnFocus = false, LayoutOrder = 2 })
+        w:_focusRing(box)
         w:_styleLabel(box, "Normal", 12)
         pad(box, 0, 10, 0, 10)
         w:_corner(box, 0.4); w:_bind(box, "BackgroundColor3", "Elevated"); w:_bind(box, "TextColor3", "Text"); w:_bind(box, "PlaceholderColor3", "SubText")
@@ -3712,14 +4219,14 @@ local Prism = (function()
         local inner = New("Frame", { Parent = outer, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y })
         pad(inner, 10, 12, 10, 22)
         New("UIListLayout", { Parent = inner, Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder })
-        local title = w:_text(inner, cfg.Title or "", 13, w:_font("Bold"), "Text")
+        local title = w:_text(inner, cfg.Title or "", 13, "Bold", "Text")
         title.TextColor3 = color
         title.LayoutOrder = 1
         -- colour is fixed, so drop the theme binding the helper created
         for i = #w._painters, 1, -1 do
             if w._painters[i].inst == title then table.remove(w._painters, i) end
         end
-        local body = w:_text(inner, cfg.Message or cfg.Description or "", 12, w:_font("Normal"), "SubText")
+        local body = w:_text(inner, cfg.Message or cfg.Description or "", 12, "Normal", "SubText")
         body.LayoutOrder = 2
         title.Visible = (cfg.Title or "") ~= ""
         body.Visible = (cfg.Message or cfg.Description or "") ~= ""
@@ -4624,6 +5131,8 @@ local Prism = (function()
         self._glass       = math.clamp(tonumber(cfg.Glass) or 0, 0, 1)
         self._pattern     = cfg.Pattern or "none"
         self._glow        = cfg.Glow == true
+        self._grouped     = cfg.GroupedSections ~= false
+        self._pageTitles  = cfg.PageTitles ~= false
         if cfg.Mobile == nil then self._touch = touchOnly() else self._touch = cfg.Mobile == true end
         self._title       = cfg.Title
         self._presetName  = type(cfg.Theme) == "string" and cfg.Theme or "Midnight"
@@ -4985,6 +5494,7 @@ local Prism = (function()
             end
             titleBlock.Size = UDim2.new(1, -(titleBlock.Position.X.Offset + gw + extra + 22), 1, 0)
             self._controlsW = gw
+            self:_fitTitleRow()
         end
         self._headerRelayout()
 
@@ -5021,6 +5531,16 @@ local Prism = (function()
         self._tabPad = New("UIPadding", { Parent = tabList })
         self._tabLayout = New("UIListLayout", { Parent = tabList, Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder })
         self._tabList = tabList
+        -- one highlight that glides between tabs (sits under the transparent tab list)
+        local hlClip = New("Frame", { Name = "HighlightClip", Parent = sidebar, BackgroundTransparency = 1, ClipsDescendants = true, ZIndex = 0 })
+        local hl = New("Frame", { Name = "TabHighlight", Parent = hlClip, BorderSizePixel = 0, Visible = false, ZIndex = 0 })
+        self:_corner(hl, 0.6)
+        self:_onTheme(hl, function() hl.BackgroundColor3 = self.Theme.Elevated:Lerp(self.Theme.Accent, 0.1) end)
+        self:_edge(hl, { flat = { key = "Stroke", t = 0.65 } })
+        local hlBar = New("Frame", { Parent = hl, AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.new(0, 3, 0.5, 0), BorderSizePixel = 0, BackgroundColor3 = Color3.new(1, 1, 1) })
+        New("UICorner", { Parent = hlBar, CornerRadius = UDim.new(1, 0) })
+        self:_gradient(hlBar, 40, 90)
+        self._tabHL, self._tabClip, self._hlBar = hl, hlClip, hlBar
 
         -- player row at the bottom of the sidebar
         if cfg.Profile ~= false and Players.LocalPlayer ~= nil then
@@ -5102,59 +5622,43 @@ local Prism = (function()
         -- resize handle
         if cfg.Resizable then
             local handle = New("TextButton", { Parent = holder, Text = "", Size = UDim2.fromOffset(16, 16), Position = UDim2.new(1, -14, 1, -14), BackgroundTransparency = 1, ZIndex = 5 })
-            local resize = false
-            handle.InputBegan:Connect(function(i) if isPress(i) and not self._minimized then resize = true end end)
-            self:_connect(UserInputService.InputChanged, function(i)
-                if resize and isMove(i) then
-                    local sx = (i.Position.X - holder.AbsolutePosition.X) / self._userScale
-                    local sy = (i.Position.Y - holder.AbsolutePosition.Y) / self._userScale
-                    self._size = Vector2.new(math.max(360, sx + 12), math.max(240, sy + 12))
+            handle.InputBegan:Connect(function(i)
+                if not isPress(i) or self._minimized then return end
+                -- the window is anchored at its centre, so move it by half the growth to keep the
+                -- top-left corner still and the bottom-right corner under the pointer
+                local start, startSize, startPos = i.Position, self._size, holder.Position
+                self:_capture(i, function(p)
+                    local sc = self._userScale
+                    local nw = math.max(360, startSize.X + (p.X - start.X) / sc)
+                    local nh = math.max(240, startSize.Y + (p.Y - start.Y) / sc)
+                    self._size = Vector2.new(nw, nh)
                     self._baseSize = self._size
-                    holder.Size = UDim2.fromOffset(self._size.X, self._size.Y)
-                end
+                    holder.Size = UDim2.fromOffset(nw, nh)
+                    holder.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + (nw - startSize.X) * sc / 2, startPos.Y.Scale, startPos.Y.Offset + (nh - startSize.Y) * sc / 2)
+                end, function() self:_layout() end)
             end)
-            self:_connect(UserInputService.InputEnded, function(i) if isPress(i) then resize = false end end)
         end
 
         -- Drag from the top bar only (mouse + touch), so controls never move the window.
         -- When minimized, a tap/click on the bar without dragging restores it.
-        local dragging, dragInput, dragStart, startPos, moved = false, nil, nil, nil, false
         local function inRect(g, p)
             local ap, as = g.AbsolutePosition, g.AbsoluteSize
             return p.X >= ap.X and p.X <= ap.X + as.X and p.Y >= ap.Y and p.Y <= ap.Y + as.Y
         end
         dragSurface.InputBegan:Connect(function(i)
             if not isPress(i) then return end
-            local p = Vector2.new(i.Position.X, i.Position.Y)
-            if inRect(self._controlGroup, p) then return end
-            dragging, dragInput, dragStart, startPos, moved = true, i, p, holder.Position, false
-            -- high-rate mice fire hundreds of move events a second; apply only the latest, once per frame
-            if self._dragStep then self._dragStep:Disconnect() end
-            self._dragStep = RunService.RenderStepped:Connect(function()
-                if self._dragPending then
-                    holder.Position = self._dragPending
-                    self._dragPending = nil
-                end
-            end)
-        end)
-        self:_connect(UserInputService.InputChanged, function(i)
-            if not dragging then return end
-            local isMouse = dragInput.UserInputType == Enum.UserInputType.MouseButton1
-            if (isMouse and i.UserInputType == Enum.UserInputType.MouseMovement) or (not isMouse and i == dragInput) then
-                local d = Vector2.new(i.Position.X - dragStart.X, i.Position.Y - dragStart.Y)
+            local start = Vector2.new(i.Position.X, i.Position.Y)
+            if inRect(self._controlGroup, start) then return end
+            local startPos, moved = holder.Position, false
+            self:_capture(i, function(p)
+                local d = Vector2.new(p.X - start.X, p.Y - start.Y)
                 if d.Magnitude > 6 then moved = true end
                 if moved then
-                    self._dragPending = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+                    holder.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
                 end
-            end
-        end)
-        self:_connect(UserInputService.InputEnded, function(i)
-            if dragging and (i == dragInput or i.UserInputType == Enum.UserInputType.MouseButton1) then
-                dragging = false
-                if self._dragPending then holder.Position = self._dragPending; self._dragPending = nil end
-                if self._dragStep then self._dragStep:Disconnect(); self._dragStep = nil end
+            end, function()
                 if not moved and self._minimized then self:SetMinimized(false) end
-            end
+            end)
         end)
 
         minBtn.MouseButton1Click:Connect(function() self:SetMinimized(not self._minimized) end)
@@ -5186,30 +5690,22 @@ local Prism = (function()
             })
             self:_bind(mark, "TextColor3", "Accent")
             self:_tooltip(fab, "Open / close")
-            local fabInput, fabStart, fabPos, moved = nil, nil, nil, false
             fab.InputBegan:Connect(function(i)
-                if isPress(i) then fabInput, fabStart, fabPos, moved = i, i.Position, fab.Position, false end
-            end)
-            self:_connect(UserInputService.InputChanged, function(i)
-                if not fabInput then return end
-                local isMouse = fabInput.UserInputType == Enum.UserInputType.MouseButton1
-                if (isMouse and i.UserInputType == Enum.UserInputType.MouseMovement) or (not isMouse and i == fabInput) then
-                    local dx, dy = i.Position.X - fabStart.X, i.Position.Y - fabStart.Y
+                if not isPress(i) then return end
+                local fabStart, fabPos, moved = i.Position, fab.Position, false
+                self:_capture(i, function(p)
+                    local dx, dy = p.X - fabStart.X, p.Y - fabStart.Y
                     if math.abs(dx) + math.abs(dy) > 8 then moved = true end
                     if moved then
                         fab.Position = UDim2.new(fabPos.X.Scale, fabPos.X.Offset + dx, fabPos.Y.Scale, fabPos.Y.Offset + dy)
                     end
-                end
-            end)
-            self:_connect(UserInputService.InputEnded, function(i)
-                if fabInput and (i == fabInput or i.UserInputType == Enum.UserInputType.MouseButton1) then
-                    fabInput = nil
+                end, function()
                     if not moved then
                         tween(fab, { Size = UDim2.fromOffset(40, 40) }, TweenInfo.new(0.07))
                         task.delay(0.08, function() tween(fab, { Size = UDim2.fromOffset(46, 46) }, TI_POP) end)
                         self:Toggle()
                     end
-                end
+                end)
             end)
             self._fab = fab
         end
