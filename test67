@@ -6,10 +6,10 @@
         Title = "My UI", Tags = { "BETA" },
         Subtitle = "auto",            -- or a custom string; "auto" shows @player
         Font = "BuilderSans",         -- any name in Prism.Fonts (Gotham, Montserrat, Ubuntu, Oswald, Michroma...)
-        TopbarStats = true,           -- FPS / ping / clock chip in the top bar
+        TopbarStats = false,          -- FPS / ping readout in the top bar
         TopbarStyle = "default",      -- "default" | "mac" (traffic-light buttons)
-        TitleGradient = true,         -- title text fades from text colour into the accent
-        Breadcrumb = true,            -- shows "› Current tab" after the title
+        TitleGradient = false,        -- title text fades from text colour into the accent
+        Breadcrumb = true,            -- shows "/ Current tab" after the title
         Mobile = nil,                 -- nil = auto-detect touch, true/false to force
         MobileScale = 0.85,           -- UI scale used on phones when Scale isn't set
         Icon = nil,                   -- optional top-bar icon (asset id or icon name)
@@ -35,12 +35,11 @@
         Nunito, Roboto, RobotoCondensed, TitilliumWeb, Oswald, JosefinSans, Jura, Michroma, Sarpanch,
         Merriweather, FredokaOne, PatrickHand, Kalam, Arcade, SciFi, RobotoMono, Code.
         Fonts missing on a client are skipped automatically. Library.Fonts lists what's available.
-      * New top bar: accent-tinted gradient background, gradient brand badge (your Icon, or the
-        title's first letter; Icon = false hides it), accent-tinted tags, pulsing online dot by the
-        subtitle, live FPS / ping / clock chip with a colour-coded FPS dot (cfg.TopbarStats = false),
-        gradient underline with a moving shimmer, slowly rotating brand gradient with a soft glow,
-        gradient title text (cfg.TitleGradient), a "› Current tab" breadcrumb (cfg.Breadcrumb),
-        accent-tinted button hovers, and cfg.TopbarStyle = "mac" for traffic-light buttons.
+      * Cleaner, flat top bar: no tint or animation, a small solid accent badge (your Icon or the
+        title's first letter; Icon = false hides it), "Title / Current tab" breadcrumb
+        (cfg.Breadcrumb = false hides it), quiet tags, a hairline divider and flat square buttons
+        that turn red on hover for close. Optional: cfg.TopbarStats = true (FPS / ping),
+        cfg.TitleGradient = true, cfg.TopbarStyle = "mac" (traffic-light buttons).
       * Sidebar tabs get a gradient indicator bar and bold active label; sections get an accent dot;
         cards get a hairline border and slightly rounder corners.
 
@@ -1741,7 +1740,7 @@ local Prism = (function()
         end
         self.ActiveTab = tab
         if self._crumb then
-            self._crumb.Text = "›  " .. tostring(tab.Title or "")
+            self._crumb.Text = "/  " .. tostring(tab.Title or "")
             self._crumb.TextTransparency = 1
             tween(self._crumb, { TextTransparency = 0 }, TI)
             self._crumb.Visible = not self._minimized
@@ -4747,78 +4746,38 @@ local Prism = (function()
         -- top bar: optional icon, title + tags, subtitle underneath, grouped controls on the right
         local HEADER_H = self._touch and 54 or 50
         self._headerH = HEADER_H
-        local top = New("Frame", { Name = "Header", Parent = main, BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, HEADER_H) })
+        local top = New("Frame", { Name = "Header", Parent = main, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, HEADER_H) })
         self._header = top
-        -- soft tinted header: surface colour washed with a hint of accent, fading toward the right
-        local topGrad = New("UIGradient", { Parent = top, Rotation = 0 })
-        self:_onTheme(top, function()
-            local th = self.Theme
-            local s = th.Surface
-            topGrad.Color = ColorSequence.new({
-                ColorSequenceKeypoint.new(0, s:Lerp(th.Accent, 0.14)),
-                ColorSequenceKeypoint.new(0.45, s:Lerp(th.Accent, 0.04)),
-                ColorSequenceKeypoint.new(1, s),
-            })
-            topGrad.Transparency = NumberSequence.new(self._minimized and 1 or math.min(0.9, (self._glass or 0) * 0.6))
-        end)
         -- invisible surface the window is dragged by (labels let input through to it)
         local dragSurface = New("TextButton", { Name = "DragSurface", Parent = top, BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Size = UDim2.fromScale(1, 1), ZIndex = 0 })
-        -- accent gradient underline that fades out to the right
-        local headerLine = New("Frame", { Parent = main, Position = UDim2.fromOffset(0, HEADER_H), Size = UDim2.new(1, 0, 0, 1), BorderSizePixel = 0, BackgroundColor3 = Color3.new(1, 1, 1) })
-        local lineGrad = New("UIGradient", { Parent = headerLine })
-        self:_onTheme(headerLine, function()
-            local a = self.Theme.Accent
-            lineGrad.Color = ColorSequence.new({
-                ColorSequenceKeypoint.new(0, a),
-                ColorSequenceKeypoint.new(0.35, shiftHue(a, 35)),
-                ColorSequenceKeypoint.new(1, self.Theme.Stroke),
-            })
-            lineGrad.Transparency = NumberSequence.new({ kp(0, 0.1), kp(0.5, 0.45), kp(1, 0.2) })
-        end)
-        local shimmer = New("Frame", { Parent = headerLine, BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Size = UDim2.new(0.25, 0, 1, 0), Position = UDim2.fromScale(-0.25, 0) })
-        New("UIGradient", { Parent = shimmer, Transparency = NumberSequence.new({ kp(0, 1), kp(0.5, 0.25), kp(1, 1) }) })
-        shimmer.Position = UDim2.fromScale(-0.3, 0)
-        loopTween(self._loops, shimmer, { Position = UDim2.fromScale(1.3, 0) }, 4.5, false, Enum.EasingStyle.Sine)
+        -- plain hairline divider
+        local headerLine = New("Frame", { Parent = main, Position = UDim2.fromOffset(0, HEADER_H), Size = UDim2.new(1, 0, 0, 1), BorderSizePixel = 0 })
+        self:_bind(headerLine, "BackgroundColor3", "Stroke")
+        self:_onTheme(headerLine, function() headerLine.BackgroundTransparency = 0.35 end)
         self._headerLine = headerLine
 
-        local BTN = self._touch and 34 or 28
+        local BTN = self._touch and 32 or 26
         local leftX = 16
-        -- brand badge: the icon if one is given, otherwise the title's first letter on an accent gradient
+        -- brand badge: small solid accent square with the icon, or the title's first letter
         if cfg.Icon ~= false then
             local iconImg = cfg.Icon and resolveIcon(cfg.Icon) or nil
-            local iconBox = New("Frame", { Name = "Brand", Parent = top, AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0), Size = UDim2.fromOffset(32, 32), BorderSizePixel = 0, BackgroundColor3 = Color3.new(1, 1, 1) })
-            self:_corner(iconBox, 0.75)
-            self:_gradient(iconBox, 45, 45)
-            self:_edge(iconBox)
-            local gloss = New("Frame", { Parent = iconBox, BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.85, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0.5, 0) })
-            self:_corner(gloss, 0.75)
-            New("UIGradient", { Parent = gloss, Rotation = 90, Transparency = NumberSequence.new({ kp(0, 0.2), kp(1, 1) }) })
+            local B = self._touch and 30 or 26
+            local iconBox = New("Frame", { Name = "Brand", Parent = top, AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 14, 0.5, 0), Size = UDim2.fromOffset(B, B), BorderSizePixel = 0 })
+            self:_corner(iconBox, 0.6)
+            self:_bind(iconBox, "BackgroundColor3", "Accent")
             if iconImg then
-                local ic = New("ImageLabel", { Parent = iconBox, BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(17, 17), Image = iconImg, ZIndex = 2 })
+                local ic = New("ImageLabel", { Parent = iconBox, BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(15, 15), Image = iconImg })
                 self:_bind(ic, "ImageColor3", "AccentText")
             else
                 local mark = New("TextLabel", {
-                    Parent = iconBox, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 2,
-                    Text = string.upper(string.sub(tostring(cfg.Title or "P"), 1, 1)), Font = self:_font("Bold"), TextSize = 17,
+                    Parent = iconBox, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
+                    Text = string.upper(string.sub(tostring(cfg.Title or "P"), 1, 1)), Font = self:_font("Bold"), TextSize = 14,
                 })
-                self:_styleLabel(mark, "Bold", 17)
+                self:_styleLabel(mark, "Bold", 14)
                 self:_bind(mark, "TextColor3", "AccentText")
             end
-            local brandGrad = iconBox:FindFirstChildOfClass("UIGradient")
-            local brandGlow = New("Frame", { Parent = top, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 28, 0.5, 0), Size = UDim2.fromOffset(44, 44), BorderSizePixel = 0, BackgroundTransparency = 0.88, ZIndex = 0 })
-            New("UICorner", { Parent = brandGlow, CornerRadius = UDim.new(1, 0) })
-            self:_bind(brandGlow, "BackgroundColor3", "Accent")
-            self._brandGlow = brandGlow
-            if brandGrad then
-                brandGrad.Rotation = 0
-                loopTween(self._loops, brandGrad, { Rotation = 360 }, 9)
-            end
-            brandGlow.BackgroundTransparency = 0.92
-            loopTween(self._loops, brandGlow, { BackgroundTransparency = 0.8 }, 1.6, true, Enum.EasingStyle.Sine)
-            iconBox.MouseEnter:Connect(function() tween(iconBox, { Rotation = -8 }, TI_POP) end)
-            iconBox.MouseLeave:Connect(function() tween(iconBox, { Rotation = 0 }, TI_POP) end)
             self._brand = iconBox
-            leftX = 54
+            leftX = 14 + B + 10
         end
 
         local subText = nil
@@ -4837,12 +4796,12 @@ local Prism = (function()
         })
         local brandTitle = New("TextLabel", {
             Parent = line1, BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 20),
-            Text = cfg.Title or "PrismUI", Font = self:_font("Bold"), TextSize = self:_ts(16),
+            Text = cfg.Title or "PrismUI", Font = self:_font("Bold"), TextSize = self:_ts(14),
             TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 1,
         })
-        self:_styleLabel(brandTitle, "Bold", 16)
+        self:_styleLabel(brandTitle, "Bold", 14)
         self:_bind(brandTitle, "TextColor3", "Text")
-        if cfg.TitleGradient ~= false then
+        if cfg.TitleGradient == true then
             -- white text so the gradient gives exact colours
             for i = #self._painters, 1, -1 do if self._painters[i].inst == brandTitle then table.remove(self._painters, i) end end
             brandTitle.TextColor3 = Color3.new(1, 1, 1)
@@ -4860,10 +4819,10 @@ local Prism = (function()
         if cfg.Breadcrumb ~= false then
             local crumb = New("TextLabel", {
                 Parent = line1, BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 20),
-                Text = "", Font = self:_font("Medium"), TextSize = self:_ts(13), RichText = true,
+                Text = "", Font = self:_font("Medium"), TextSize = self:_ts(14), RichText = true,
                 TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 100, TextTransparency = 0,
             })
-            self:_styleLabel(crumb, "Medium", 13)
+            self:_styleLabel(crumb, "Medium", 14)
             self:_bind(crumb, "TextColor3", "SubText")
             self._crumb = crumb
         end
@@ -4877,23 +4836,19 @@ local Prism = (function()
             end
             if text ~= "" then
                 local pill = New("TextLabel", {
-                    Parent = line1, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 17), BorderSizePixel = 0,
+                    Parent = line1, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 16), BorderSizePixel = 0,
                     Text = string.upper(text), Font = self:_font("Bold"), TextSize = self:_ts(9), LayoutOrder = 1 + index,
                 })
                 self:_styleLabel(pill, "Bold", 9)
-                self:_corner(pill, "pill")
-                pad(pill, 0, 7, 0, 7)
+                self:_corner(pill, 0.35)
+                pad(pill, 0, 6, 0, 6)
                 if color then
                     pill.TextColor3 = color
                     self:_onTheme(pill, function() pill.BackgroundColor3 = color:Lerp(self.Theme.Background, 0.85) end)
                 else
-                    self:_onTheme(pill, function()
-                        pill.BackgroundColor3 = self.Theme.Accent:Lerp(self.Theme.Background, 0.8)
-                        pill.TextColor3 = self.Theme.Accent:Lerp(self.Theme.Text, 0.25)
-                    end)
+                    self:_bind(pill, "BackgroundColor3", "Elevated")
+                    self:_bind(pill, "TextColor3", "SubText")
                 end
-                local pst = New("UIStroke", { Parent = pill, Thickness = 1, Transparency = 0.6, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
-                self:_onTheme(pill, function() pst.Color = color or self.Theme.Accent end)
             end
         end
         if subText then
@@ -4905,29 +4860,20 @@ local Prism = (function()
             self:_styleLabel(sub, "Medium", 11)
             self:_bind(sub, "TextColor3", "SubText")
             pad(sub, 0, 0, 0, 11)
-            local dot = New("Frame", { Parent = sub, AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, -11, 0.5, 0), Size = UDim2.fromOffset(6, 6), BorderSizePixel = 0, BackgroundColor3 = rgb(52, 211, 120) })
+            local dot = New("Frame", { Parent = sub, AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, -11, 0.5, 0), Size = UDim2.fromOffset(5, 5), BorderSizePixel = 0, BackgroundColor3 = rgb(52, 211, 120) })
             New("UICorner", { Parent = dot, CornerRadius = UDim.new(1, 0) })
-            local halo = New("UIStroke", { Parent = dot, Color = rgb(52, 211, 120), Thickness = 2, Transparency = 0.7 })
-            halo.Transparency = 0.95
-            loopTween(self._loops, halo, { Transparency = 0.55 }, 1, true, Enum.EasingStyle.Sine)
             self._subLabel = sub
         end
 
         -- controls grouped in a pill
         local group = New("Frame", {
-            Name = "Controls", Parent = top, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0),
-            Size = UDim2.fromOffset(0, BTN + 6), AutomaticSize = Enum.AutomaticSize.X, BorderSizePixel = 0,
+            Name = "Controls", Parent = top, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0),
+            Size = UDim2.fromOffset(0, BTN), AutomaticSize = Enum.AutomaticSize.X, BorderSizePixel = 0,
         })
-        self:_corner(group, "pill")
-        self:_onTheme(group, function()
-            group.BackgroundColor3 = self.Theme.Surface
-            group.BackgroundTransparency = self._minimized and 1 or 0
-        end)
-        self:_edge(group, { flat = { key = "Stroke", t = 0.45 }, hide = function() return self._minimized == true end })
-        pad(group, 0, 3, 0, 3)
+        group.BackgroundTransparency = 1
         New("UIListLayout", {
             Parent = group, FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center,
-            Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder,
+            Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder,
         })
         self._controlGroup = group
         local MAC = self._topbarStyle == "mac"
@@ -4937,7 +4883,7 @@ local Prism = (function()
                 Parent = group, Size = UDim2.fromOffset(BTN, BTN), Text = "", AutoButtonColor = false,
                 BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = order,
             })
-            self:_corner(b, "pill")
+            self:_corner(b, MAC and "pill" or 0.5)
             local image
             if iconName and MAC then
                 local dotSize = self._touch and 16 or 13
@@ -4957,7 +4903,7 @@ local Prism = (function()
                     Size = UDim2.fromOffset(14, 14), BackgroundTransparency = 1, Image = resolveIcon(iconName),
                 })
                 self:_onTheme(b, function()
-                    b.BackgroundColor3 = danger and rgb(220, 70, 84) or self.Theme.Elevated:Lerp(self.Theme.Accent, 0.18)
+                    b.BackgroundColor3 = danger and rgb(220, 70, 84) or self.Theme.Elevated
                     image.ImageColor3 = self.Theme.SubText
                 end)
                 b.MouseEnter:Connect(function()
@@ -5001,14 +4947,12 @@ local Prism = (function()
 
         -- live FPS / ping chip next to the controls (cfg.TopbarStats = false hides it)
         local statsChip
-        if cfg.TopbarStats ~= false then
+        if cfg.TopbarStats == true then
             statsChip = New("Frame", {
                 Name = "Stats", Parent = top, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -100, 0.5, 0),
-                Size = UDim2.fromOffset(150, BTN), BorderSizePixel = 0,
+                Size = UDim2.fromOffset(110, BTN), BorderSizePixel = 0,
             })
-            self:_corner(statsChip, "pill")
-            self:_onTheme(statsChip, function() statsChip.BackgroundColor3 = self.Theme.Surface end)
-            self:_edge(statsChip, { flat = { key = "Stroke", t = 0.45 } })
+            statsChip.BackgroundTransparency = 1
             local statsLabel = New("TextLabel", {
                 Parent = statsChip, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
                 Text = "-- fps · -- ms", Font = self:_font("Medium"), TextSize = self:_ts(11), RichText = true,
@@ -5024,7 +4968,7 @@ local Prism = (function()
                     local ping = 0
                     pcall(function() ping = math.floor(Players.LocalPlayer:GetNetworkPing() * 1000 + 0.5) end)
                     local fpsCol = fps >= 50 and "#34D399" or (fps >= 30 and "#FBBF24" or "#F87171")
-                    statsLabel.Text = string.format('<font color="%s">●</font>  %d fps · %d ms · %s', fpsCol, fps, ping, os.date("%H:%M"))
+                    statsLabel.Text = string.format('<font color="%s">●</font> %d fps   %d ms', fpsCol, fps, ping)
                 end
                 acc, frames = 0, 0
             end)
@@ -5034,7 +4978,7 @@ local Prism = (function()
         self._headerRelayout = function()
             local n = 0
             for _, b in ipairs({ pinBtn, minBtn, closeBtn }) do if b.Visible then n += 1 end end
-            local gw = n * BTN + (n - 1) * 2 + 6
+            local gw = n * BTN + (n - 1) * 4
             local extra = 0
             if statsChip then
                 statsChip.Visible = not self._minimized and (self._size and self._size.X or 600) >= 580
