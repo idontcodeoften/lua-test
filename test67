@@ -846,7 +846,9 @@ local Prism = (function()
 
     function Window:_paintShadow()
         if self._shadow and self._shadow:IsA("ImageLabel") then self._shadow.ImageTransparency = self._minimized and 0.6 or 0.45 end
-        if self._glowImage then self._glowImage.ImageTransparency = self._minimized and 0.75 or 0.55 end
+        for _, g in ipairs(self._glowRings or {}) do
+            g.corner.CornerRadius = self._minimized and UDim.new(1, 0) or UDim.new(0, self.CornerRadius)
+        end
         for _, l in ipairs(self._shadowLayers or {}) do
             if self._minimized then
                 l.corner.CornerRadius = UDim.new(1, 0)
@@ -4670,14 +4672,25 @@ local Prism = (function()
 
         -- soft 9-slice images for the glow and the drop shadow: one image each, smooth falloff,
         -- no visible banding (the old stacked frames showed hard rings)
-        local glow = New("ImageLabel", {
-            Name = "Glow", Parent = holder, BackgroundTransparency = 1, Image = SHADOW_IMAGE,
-            ScaleType = Enum.ScaleType.Slice, SliceCenter = SHADOW_SLICE, SliceScale = 0.6,
-            Size = UDim2.new(1, 70, 1, 70), Position = UDim2.fromScale(0.5, 0.5),
-            AnchorPoint = Vector2.new(0.5, 0.5), ZIndex = -1, Visible = self._glow, ImageTransparency = 0.55,
-        })
-        self:_bind(glow, "ImageColor3", "Accent")
+        -- accent glow: a few rounded outlines stacked outside the window edge. Each is faint, they
+        -- overlap most right at the edge, so the colour fades out smoothly and always matches the corners.
+        local glow = New("Frame", { Name = "Glow", Parent = holder, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = -1, Visible = self._glow })
+        local glowRings = {}
+        for i = 1, 6 do
+            local ring = New("Frame", { Parent = glow, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = -1 })
+            local c = New("UICorner", { Parent = ring })
+            local st = New("UIStroke", { Parent = ring, Thickness = i * 2.5, Transparency = 0.86 + i * 0.015, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, LineJoinMode = Enum.LineJoinMode.Round })
+            table.insert(glowRings, { corner = c, stroke = st })
+        end
+        self:_onTheme(glow, function()
+            local r = self._minimized and UDim.new(1, 0) or UDim.new(0, self.CornerRadius)
+            for _, g in ipairs(glowRings) do
+                g.stroke.Color = self.Theme.Accent
+                g.corner.CornerRadius = r
+            end
+        end)
         self._glowImage = glow
+        self._glowRings = glowRings
 
         local shadow = New("ImageLabel", {
             Name = "Shadow", Parent = holder, BackgroundTransparency = 1, Image = SHADOW_IMAGE,
