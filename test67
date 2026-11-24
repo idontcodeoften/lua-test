@@ -26,13 +26,28 @@
         Glass = 0,                    -- 0 = opaque, 1 = fully frosted
         Pattern = "none",             -- "none" | "dots" | "grid"
         Blob = false,                 -- accent blob fading in a page corner
-        Glow = false,                 -- accent glow behind the window
+        Glow = false,                 -- edge pulse: accent rings ripple out from the window
         AnimatedBorder = false,       -- slowly rotating accent gradient border
         Rainbow = false,              -- slow hue-cycling accent
         Profile = true,               -- player card at the bottom of the sidebar
     })
 
     What's new in v1.9
+      * Dropdown fix: options sometimes couldn't be picked because the "clicked outside the menu"
+        check measured the click in a different coordinate space from the menu, closing it under
+        your cursor. It now uses true screen positions and also waits a frame for the menu's own
+        buttons to report the press. The menu also follows its box when the page scrolls (it used
+        to close on any scroll). All drags, the colour picker and ripples share the same position
+        helper, and clicks on the window's top-bar buttons can no longer start a window drag.
+      * Big optimisation pass: theme fades / rainbow / catch-up repaints set colours directly instead
+        of creating a tween per painter per frame, and the theme fade runs at 30 Hz; cards no longer
+        scale on press (that re-laid out the whole page every frame); the tab highlight follows the
+        tab list instead of listening to every tab button (dragging the window fired them all);
+        graphs and sparklines redraw only when their real size changes (open/close animations used
+        to redraw them every frame) and now draw at the right size when the UI is scaled; dots
+        pattern is ~20 labels instead of ~600 frames; card outlines only create a gradient when 3D
+        edges / liquid glass need one; the Appearance tab builds on first open; sidebar search waits
+        for typing to pause.
       * Fixes: switching to a single-weight font (Ubuntu, Oswald...) and back no longer leaves every
         label bold; toasts measure and draw text with the active font; AddSection inside a column
         stays in that column; :SetDisabled no longer rescans the whole card each call; a long title
@@ -309,10 +324,12 @@ local Prism = (function()
         return inst
     end
 
-    local ANIM = { speed = 1 } -- global animation speed; 0 = no animation
+    -- speed: global animation speed (0 = none). instant > 0 while a repaint burst runs (theme fade,
+    -- rainbow): every painter then sets its colours directly instead of creating hundreds of tweens.
+    local ANIM = { speed = 1, instant = 0 }
     local function tween(inst, props, info)
         info = info or TI
-        if ANIM.speed <= 0 then
+        if ANIM.speed <= 0 or ANIM.instant > 0 then
             for k, v in pairs(props) do inst[k] = v end
             return
         end
@@ -351,6 +368,15 @@ local Prism = (function()
 
     local function isPress(i) return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch end
     local function isMove(i)  return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch end
+    -- Pointer position in the same space as this gui's AbsolutePosition (IgnoreGuiInset = true).
+    -- Mouse: GetMouseLocation is true screen space. Touch: add the top bar inset.
+    local function screenPos(i)
+        local t = i.UserInputType
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.MouseButton2 then
+            return UserInputService:GetMouseLocation()
+        end
+        return Vector2.new(i.Position.X, i.Position.Y + GuiService:GetGuiInset().Y)
+    end
 
     local function pad(parent, t, r, b, l)
         return New("UIPadding", {
@@ -407,12 +433,20 @@ local Prism = (function()
         self.Theme = t
     end
 
+    function Window:_refreshInstant()
+        ANIM.instant += 1
+        self:_refresh()
+        ANIM.instant -= 1
+    end
+
     function Window:_paintPage(page)
         if not (self._dirtyPages and self._dirtyPages[page]) then return end
         self._dirtyPages[page] = nil
+        ANIM.instant += 1
         for _, p in ipairs(self._painters) do
             if p.page == page and p.inst.Parent then pcall(p.fn) end
         end
+        ANIM.instant -= 1
     end
 
     function Window:_onTheme(inst, fn)
@@ -501,16 +535,19 @@ local Prism = (function()
                 conn:Disconnect()
                 if self._themeConn == conn then self._themeConn = nil end
                 self.Theme = target
-                self:_refresh()
+                self:_refreshInstant()
                 return
             end
+            -- 30 updates a second is smooth for a colour fade and halves the repaint work at 60 fps+
+            if os.clock() - (self._themeStepT or 0) < 1 / 30 then return end
+            self._themeStepT = os.clock()
             local e = 1 - (1 - a) ^ 3
             local mix = {}
             for k, v in pairs(target) do
                 mix[k] = (typeof(v) == "Color3" and old[k]) and old[k]:Lerp(v, e) or v
             end
             self.Theme = mix
-            self:_refresh()
+            self:_refreshInstant()
         end)
         self._themeConn = conn
     end
@@ -548,7 +585,12 @@ local Prism = (function()
     function Window:_edge(inst, opts)
         opts = opts or {}
         local st = New("UIStroke", { Name = "Edge", Parent = inst, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
-        local g = New("UIGradient", { Parent = st, Rotation = 90 })
+        -- the gradient is only needed for 3D edges / liquid glass; most strokes never get one
+        local g
+        local function grad()
+            if not g then g = New("UIGradient", { Parent = st, Rotation = 90 }) end
+            return g
+        end
         local WHITE, BLACK = Color3.new(1, 1, 1), Color3.new(0, 0, 0)
         self:_onTheme(inst, function()
             if opts.hide and opts.hide() then
@@ -557,17 +599,19 @@ local Prism = (function()
                 local hi, lo = WHITE, BLACK
                 if opts.inset then hi, lo = BLACK, WHITE end
                 st.Enabled, st.Color, st.Transparency, st.Thickness = true, WHITE, 0, opts.inset and 1 or 1.25
+                local g = grad()
                 g.Enabled = true
                 g.Color = ColorSequence.new({ ColorSequenceKeypoint.new(0, hi), ColorSequenceKeypoint.new(0.5, hi:Lerp(lo, 0.5)), ColorSequenceKeypoint.new(1, lo) })
                 g.Transparency = NumberSequence.new({ kp(0, opts.inset and 0.55 or 0.5), kp(0.5, 0.8), kp(1, opts.inset and 0.75 or 0.6) })
             elseif self._liquid then
                 st.Enabled, st.Color, st.Transparency, st.Thickness = true, WHITE, 0, 1
+                local g = grad()
                 g.Enabled = true
                 g.Color = ColorSequence.new(WHITE)
                 g.Transparency = NumberSequence.new({ kp(0, opts.inset and 0.9 or 0.55), kp(0.5, 0.8), kp(1, opts.inset and 0.85 or 0.86) })
             elseif opts.flat then
                 st.Enabled, st.Thickness = true, 1
-                g.Enabled = false
+                if g then g.Enabled = false end
                 st.Color = self.Theme[opts.flat.key or "Stroke"]
                 st.Transparency = opts.flat.t or 0
             else
@@ -735,8 +779,7 @@ local Prism = (function()
         local size = card.AbsoluteSize / sc
         local clip = New("Frame", { Parent = layer, BackgroundTransparency = 1, ClipsDescendants = true, ZIndex = 40,
             Position = UDim2.fromOffset(origin.X, origin.Y), Size = UDim2.fromOffset(size.X, size.Y) })
-        -- input positions exclude the top bar inset; this gui (IgnoreGuiInset) includes it
-        local rel = (Vector2.new(input.Position.X, input.Position.Y + GuiService:GetGuiInset().Y) - card.AbsolutePosition) / sc
+        local rel = (screenPos(input) - card.AbsolutePosition) / sc
         local d = math.max(size.X, size.Y) * 2.2
         local r = New("Frame", { Parent = clip, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(rel.X, rel.Y),
             Size = UDim2.fromOffset(0, 0), BorderSizePixel = 0, BackgroundColor3 = self.Theme.Accent, BackgroundTransparency = 0.84, ZIndex = 40 })
@@ -771,16 +814,32 @@ local Prism = (function()
             self:_connect(UserInputService.InputBegan, function(i)
                 local cur = self._popup
                 if not cur or not isPress(i) then return end
-                local pt = Vector2.new(i.Position.X, i.Position.Y + GuiService:GetGuiInset().Y)
+                -- Two independent checks must both say "outside" before the menu closes:
+                -- 1) geometry. Mouse uses GetMouseLocation (true screen space, same as this gui's
+                --    AbsolutePosition); touch adds the top bar inset to its position.
+                local pt = screenPos(i)
                 local function inside(g)
                     if not g or not g.Parent then return false end
                     local ap, as = g.AbsolutePosition, g.AbsoluteSize
-                    return pt.X >= ap.X and pt.X <= ap.X + as.X and pt.Y >= ap.Y and pt.Y <= ap.Y + as.Y
+                    return pt.X >= ap.X - 2 and pt.X <= ap.X + as.X + 2 and pt.Y >= ap.Y - 2 and pt.Y <= ap.Y + as.Y + 2
                 end
-                if not inside(cur.frame) and not inside(cur.anchor) then self:_closePopup() end
+                if inside(cur.frame) or inside(cur.anchor) then return end
+                -- 2) the menu's own controls. Any press on the menu, its options, its search box or
+                --    the dropdown box marks a hit; wait a frame for those events, then decide.
+                self._popupHit = false
+                self._popupPress = (self._popupPress or 0) + 1
+                local my = self._popupPress
+                task.spawn(function()
+                    RunService.Heartbeat:Wait()
+                    if my == self._popupPress and not self._popupHit and self._popup == cur then
+                        self:_closePopup()
+                    end
+                end)
             end)
         end
     end
+
+    function Window:_markPopupHit() self._popupHit = true end
 
     function Window:_closePopup()
         local p = self._popup
@@ -801,7 +860,7 @@ local Prism = (function()
             self:_connect(UserInputService.InputChanged, function(i)
                 local c = self._cap
                 if c and ((c.mouse and i.UserInputType == Enum.UserInputType.MouseMovement) or (not c.mouse and i == c.input)) then
-                    c.pos = i.Position
+                    c.pos = screenPos(i)
                 end
             end)
             self:_connect(UserInputService.InputEnded, function(i)
@@ -903,7 +962,7 @@ local Prism = (function()
 
     function Window:SetGlow(on)
         self._glow = on == true
-        if self._glowImage then self._glowImage.Visible = self._glow end
+        if self._glowImage then self._glowImage.Visible = self._glow and not self._minimized end
     end
 
     local NOTIF_POSITIONS = {
@@ -953,7 +1012,7 @@ local Prism = (function()
                     if not self._open or self._minimized or os.clock() - (self._lastHue or 0) < 1 / 12 then return end
                     self._lastHue = os.clock()
                     self._accent = Color3.fromHSV((os.clock() * 0.06) % 1, 0.6, 1)
-                    self:_buildTheme(); self:_refresh()
+                    self:_buildTheme(); self:_refreshInstant()
                 end)
                 table.insert(self._conns, self._rainbowConn)
             end
@@ -1060,8 +1119,17 @@ local Prism = (function()
 
     function Window:_paintShadow()
         if self._shadow and self._shadow:IsA("ImageLabel") then self._shadow.ImageTransparency = self._minimized and 0.6 or 0.45 end
-        for _, g in ipairs(self._glowRings or {}) do
-            g.corner.CornerRadius = self._minimized and UDim.new(1, 0) or UDim.new(0, self.CornerRadius)
+        if self._glowImage then self._glowImage.Visible = self._glow == true and not self._minimized end
+        if self._startPulse and self._pulseRadius ~= self.CornerRadius then
+            self._pulseRadius = self.CornerRadius
+            -- drop the old ring tweens from the loop list before restarting with the new radius
+            local keep = {}
+            for _, tw in ipairs(self._loops) do
+                local inst = tw.Instance
+                if not (inst and inst:IsDescendantOf(self._glowImage)) then table.insert(keep, tw) end
+            end
+            self._loops = keep
+            self._startPulse()
         end
         for _, l in ipairs(self._shadowLayers or {}) do
             if self._minimized then
@@ -1693,7 +1761,7 @@ local Prism = (function()
     function Window:_draggable(handle, target, isLocked)
         handle.InputBegan:Connect(function(i)
             if not isPress(i) or (isLocked and isLocked()) then return end
-            local start, pos = i.Position, target.Position
+            local start, pos = screenPos(i), target.Position
             self:_capture(i, function(p)
                 target.Position = UDim2.new(pos.X.Scale, pos.X.Offset + (p.X - start.X), pos.Y.Scale, pos.Y.Offset + (p.Y - start.Y))
             end)
@@ -2084,6 +2152,7 @@ local Prism = (function()
             self:_fitTitleRow()
         end
         self:_closePopup()
+        self:_buildLazy(tab)
         self:_paintPage(tab.Page)
         self:_moveHighlight(true)
         task.defer(function() self:_updateFades(tab.Page) end)
@@ -2109,6 +2178,7 @@ local Prism = (function()
     end
 
     function Window:_applySearch(query)
+        if query and query ~= "" then self:_buildAllLazy() end
         query = (tostring(query or ""):lower():match("^%s*(.-)%s*$"))
         local counts = {}
         for i = #self._searchIndex, 1, -1 do
@@ -2453,7 +2523,7 @@ local Prism = (function()
         local touchStart, swiped = nil, false
         card.InputBegan:Connect(function(input)
             if input.UserInputType == Enum.UserInputType.Touch then
-                touchStart, swiped = input.Position, false
+                touchStart, swiped = screenPos(input), false
                 setPaused(true)
                 self:_capture(input, function(p)
                     if n.dismissed or swiped or not touchStart then return end
@@ -2483,7 +2553,7 @@ local Prism = (function()
 
         self._navOrder = (self._navOrder or 0) + 1
         local BH = self._touch and 38 or 32
-        local btn = New("TextButton", { Parent = self._tabList, Size = UDim2.new(1, 0, 0, BH), Text = "", AutoButtonColor = false, BorderSizePixel = 0, BackgroundTransparency = 1, LayoutOrder = self._navOrder, ClipsDescendants = true })
+        local btn = New("TextButton", { Parent = self._tabList, Size = UDim2.new(1, 0, 0, BH), Text = "", AutoButtonColor = false, BorderSizePixel = 0, BackgroundTransparency = 1, LayoutOrder = self._navOrder })
         tab._btn = btn
         self:_corner(btn, 0.6)
         local btnPad = New("UIPadding", { Parent = btn })
@@ -2565,13 +2635,7 @@ local Prism = (function()
             tween(btn, { BackgroundTransparency = 1 }, MOTION.Fast)
             tween(label, { TextColor3 = self.Theme.SubText }, MOTION.Fast)
         end)
-        -- keep the shared highlight glued to the active button through scrolling, resizing, search, dragging
-        btn:GetPropertyChangedSignal("AbsolutePosition"):Connect(function()
-            if self.ActiveTab == tab then self:_moveHighlight(false) end
-        end)
-        btn:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
-            if self.ActiveTab == tab then self:_moveHighlight(false) end
-        end)
+
         btn.MouseButton1Click:Connect(function() self:SelectTab(tab) end)
 
         local page = New("ScrollingFrame", {
@@ -2615,8 +2679,28 @@ local Prism = (function()
         return label
     end
 
+    -- The Appearance tab is ~60 widgets (several colour pickers among them). It's built the first time
+    -- it's opened, searched, or a config is saved/loaded, so startup doesn't pay for it.
     function Window:AddAppearanceTab(title)
         local tab = self:AddTab({ Title = title or "Appearance", Icon = "settings" })
+        tab._lazy = function() self:_buildAppearance(tab) end
+        if self.ActiveTab == tab then self:_buildLazy(tab) end
+        return tab
+    end
+
+    function Window:_buildLazy(tab)
+        local f = tab and tab._lazy
+        if not f then return end
+        tab._lazy = nil
+        local ok, err = pcall(f)
+        if not ok then warn("[PrismUI] building tab failed: " .. tostring(err)) end
+    end
+
+    function Window:_buildAllLazy()
+        for _, t in ipairs(self.Tabs) do if t._lazy then self:_buildLazy(t) end end
+    end
+
+    function Window:_buildAppearance(tab)
         local names = {}
         for n in pairs(Library.Themes) do table.insert(names, n) end
         table.sort(names)
@@ -2686,7 +2770,7 @@ local Prism = (function()
 
         tab:AddSection("Effects")
         tab:AddSlider({ ConfigKey = "Animation speed", Title = "Animation speed", Description = "0 turns animations off.", Min = 0, Max = 2, Increment = 0.25, Default = ANIM.speed, Suffix = "x", Callback = function(v) self:SetAnimationSpeed(v) end })
-        tab:AddToggle({ ConfigKey = "Window glow", Title = "Accent glow", Default = self._glow == true, Callback = function(on) self:SetGlow(on) end })
+        tab:AddToggle({ ConfigKey = "Window glow", Title = "Edge pulse", Description = "Accent rings ripple out from the window's edge.", Default = self._glow == true, Callback = function(on) self:SetGlow(on) end })
         tab:AddToggle({ ConfigKey = "Animated border", Title = "Animated border", Default = self._animBorder == true, Callback = function(on) self:SetAnimatedBorder(on) end })
         tab:AddToggle({ ConfigKey = "Liquid glass", Title = "Liquid glass", Description = "See-through panels with a moving sheen over the blurred game.", Default = self._liquid == true, Callback = function(on) self:SetLiquidGlass(on) end })
         tab:AddToggle({ ConfigKey = "3D edges", Title = "3D edges", Description = "Bevelled cards, buttons and window edges.", Default = self._bevel == true, Callback = function(on) self:SetEdges3D(on) end })
@@ -2713,7 +2797,6 @@ local Prism = (function()
             tab:AddToggle({ ConfigKey = "Floating button", Title = "Floating button", Description = "The round button that opens the window.", Default = true, Callback = function(on) self._fabWanted = on; self:SetMobileButtonVisible(on) end })
         end
         tab:AddButton({ Title = "Recenter window", Callback = function() self:Center() end })
-        return tab
     end
 
     ------------------------------------------------------------------ elements
@@ -2876,7 +2959,6 @@ local Prism = (function()
                 if flatEdge() then tween(st, { Color = w.Theme.Stroke, Transparency = 0.7 }, TI) end
             end
         end)
-        local press = New("UIScale", { Parent = card })
         card.InputBegan:Connect(function(input)
             if isPress(input) then
                 if row then
@@ -2884,7 +2966,6 @@ local Prism = (function()
                 else
                     tween(card, { BackgroundColor3 = w.Theme.Elevated }, TweenInfo.new(0.07))
                 end
-                tween(press, { Scale = 0.985 }, TweenInfo.new(0.08))
                 w:_ripple(card, input)
             end
         end)
@@ -2895,7 +2976,6 @@ local Prism = (function()
                 else
                     tween(card, { BackgroundColor3 = hovered and w.Theme.Surface:Lerp(w.Theme.Elevated, 0.7) or w.Theme.Surface }, TI)
                 end
-                tween(press, { Scale = 1 }, TI_POP)
             end
         end)
     end
@@ -3239,7 +3319,7 @@ local Prism = (function()
         local page = self.Page
         hit.InputBegan:Connect(function(i)
             if not isPress(i) then return end
-            fromX(i.Position.X)
+            fromX(screenPos(i).X)
             page.ScrollingEnabled = false -- keep the page still while dragging on touch
             tween(knob, { Size = UDim2.fromOffset(ks + 4, ks + 4) }, MOTION.Fast)
             showBubble(true)
@@ -3286,6 +3366,7 @@ local Prism = (function()
         New("UIListLayout", { Parent = pop, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder })
         local popScale = New("UIScale", { Parent = pop })
         card.Destroying:Connect(function() pop:Destroy() end)
+        pop.InputBegan:Connect(function(i) if isPress(i) then w:_markPopupHit() end end)
 
         -- search field, shown when the list is long
         local searchBox = New("TextBox", {
@@ -3302,6 +3383,9 @@ local Prism = (function()
         local list = New("ScrollingFrame", { Parent = pop, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 0), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3, LayoutOrder = 2, ZIndex = 61 })
         w:_bind(list, "ScrollBarImageColor3", "Stroke")
         New("UIListLayout", { Parent = list, Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder })
+        list.InputBegan:Connect(function(i) if isPress(i) then w:_markPopupHit() end end)
+        searchBox.InputBegan:Connect(function(i) if isPress(i) then w:_markPopupHit() end end)
+        searchBox.Focused:Connect(function() w:_markPopupHit() end)
 
         local obj, painters = {}, {}
         local filter = ""
@@ -3333,6 +3417,27 @@ local Prism = (function()
         local function popHeight()
             return listHeight() + (searchBox.Visible and 30 or 0) + 12
         end
+        -- Positions the menu under the box (right edges aligned), or above it if there's no room
+        -- below. decide = true picks the side; false keeps the side picked when it opened.
+        local openAbove = false
+        local function placePop(decide)
+            local layer = pop.Parent
+            local sc = w:_uiScale()
+            local rel = (box.AbsolutePosition - layer.AbsolutePosition) / sc
+            local bs = box.AbsoluteSize / sc
+            local ls = layer.AbsoluteSize / sc
+            local width = math.max(bs.X, 180)
+            local h = popHeight()
+            local x = math.clamp(rel.X + bs.X - width, 4, math.max(4, ls.X - width - 4))
+            local below = rel.Y + bs.Y + 6
+            if decide then
+                local above = rel.Y - h - 6
+                openAbove = below + h > ls.Y - 4 and above > 4
+            end
+            pop.AnchorPoint = Vector2.new(0, openAbove and 1 or 0)
+            pop.Position = UDim2.fromOffset(x, openAbove and (rel.Y - 6) or below)
+            return width, h
+        end
         local function setOpen(open)
             if open == isOpen then return end
             isOpen = open
@@ -3343,28 +3448,21 @@ local Prism = (function()
                 w:_openPopup({ frame = pop, anchor = box, close = function() setOpen(false) end })
                 searchBox.Visible = #values > 7
                 list.Size = UDim2.new(1, 0, 0, listHeight())
-                -- place under the box (right edges aligned), or above it if there's no room below
-                local layer = pop.Parent
-                local sc = w:_uiScale()
-                local rel = (box.AbsolutePosition - layer.AbsolutePosition) / sc
-                local bs = box.AbsoluteSize / sc
-                local ls = layer.AbsoluteSize / sc
-                local width = math.max(bs.X, 180)
-                local h = popHeight()
-                local x = math.clamp(rel.X + bs.X - width, 4, math.max(4, ls.X - width - 4))
-                local below = rel.Y + bs.Y + 6
-                local above = rel.Y - h - 6
-                local useAbove = below + h > ls.Y - 4 and above > 4
-                pop.AnchorPoint = Vector2.new(0, useAbove and 1 or 0)
-                pop.Position = UDim2.fromOffset(x, useAbove and (rel.Y - 6) or below)
+                local width, h = placePop(true)
                 pop.Size = UDim2.fromOffset(width, 0)
                 pop.Visible = true
                 popScale.Scale = 0.96
                 tween(pop, { Size = UDim2.fromOffset(width, h) }, MOTION.Base)
                 tween(popScale, { Scale = 1 }, MOTION.Base)
-                -- scrolling the page would leave the menu floating in the wrong place, so close it
+                -- the menu follows its box while the page scrolls; it closes once the box leaves the page
                 if scrollConn then scrollConn:Disconnect() end
-                scrollConn = tab.Page:GetPropertyChangedSignal("CanvasPosition"):Connect(function() setOpen(false) end)
+                local page = tab.Page
+                scrollConn = page:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+                    if not isOpen then return end
+                    local py, ph = page.AbsolutePosition.Y, page.AbsoluteSize.Y
+                    local by, bh = box.AbsolutePosition.Y, box.AbsoluteSize.Y
+                    if by + bh < py or by > py + ph then setOpen(false) else placePop(false) end
+                end)
             else
                 if scrollConn then scrollConn:Disconnect(); scrollConn = nil end
                 if w._popup and w._popup.frame == pop then w._popup = nil end
@@ -3391,7 +3489,7 @@ local Prism = (function()
             painters = {}
             filter = ""
             for i, val in ipairs(values) do
-                local b = New("TextButton", { Name = tostring(val), Parent = list, ZIndex = 61, Size = UDim2.new(1, -6, 0, w._touch and 36 or 28), Text = "", Font = w:_font("Medium"), TextSize = w:_ts(13), AutoButtonColor = false, BorderSizePixel = 0, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = i, ClipsDescendants = true })
+                local b = New("TextButton", { Name = tostring(val), Parent = list, ZIndex = 61, Size = UDim2.new(1, -6, 0, w._touch and 36 or 28), Text = "", Font = w:_font("Medium"), TextSize = w:_ts(13), AutoButtonColor = false, BorderSizePixel = 0, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = i })
                 w:_styleLabel(b, "Medium", 13)
                 local swatchColor = type(cfg.Swatch) == "table" and cfg.Swatch[val] or nil
                 local textPad = 10
@@ -3417,6 +3515,8 @@ local Prism = (function()
                     end
                 end)
                 b.MouseLeave:Connect(function() paint() end)
+                b.MouseButton1Down:Connect(function() w:_markPopupHit() end)
+                b.InputBegan:Connect(function(i) if isPress(i) then w:_markPopupHit() end end)
                 b.MouseButton1Click:Connect(function() choose(val) end)
             end
             resizePop()
@@ -3449,6 +3549,7 @@ local Prism = (function()
             end
             display(); repaint(); safe(cfg.Callback, obj:Get())
         end
+        box.MouseButton1Down:Connect(function() w:_markPopupHit() end)
         box.MouseButton1Click:Connect(function() setOpen(not isOpen) end)
         rebuild()
         return self:_registerState(cfg, obj)
@@ -3685,9 +3786,27 @@ local Prism = (function()
             w:_corner(alphaBar, "pill")
             w:_bind(alphaBar, "BackgroundColor3", "Elevated")
             -- simple checker hint behind the fill
-            for i = 0, 15 do
-                local sq = New("Frame", { Parent = alphaBar, Position = UDim2.new(i / 16, 0, i % 2 == 0 and 0 or 0.5, 0), Size = UDim2.new(1 / 16, 0, 0.5, 0), BorderSizePixel = 0, BackgroundTransparency = 0.6 })
+            -- checker hint: two striped rows (a hard-edged gradient each) instead of 16 squares
+            for rowI = 0, 1 do
+                local sq = New("Frame", { Parent = alphaBar, Position = UDim2.new(0, 0, rowI * 0.5, 0), Size = UDim2.new(1, 0, 0.5, 0), BorderSizePixel = 0, BackgroundTransparency = 0.6 })
                 w:_bind(sq, "BackgroundColor3", "Stroke")
+                local kps = {}
+                for i = 0, 6 do
+                    local x0, x1 = i / 6, math.min((i + 0.5) / 6, 1)
+                    local on = (i + rowI) % 2 == 0
+                    table.insert(kps, kp(x0, on and 0 or 1))
+                    if x1 < 1 then
+                        table.insert(kps, kp(math.min(x1 - 0.0001, 1), on and 0 or 1))
+                        table.insert(kps, kp(x1, on and 1 or 0))
+                    end
+                end
+                -- keep within the 20-keypoint limit and strictly increasing
+                local clean, last = {}, -1
+                for _, k in ipairs(kps) do
+                    if k.Time > last and #clean < 19 then table.insert(clean, k); last = k.Time end
+                end
+                if clean[#clean].Time < 1 then table.insert(clean, kp(1, clean[#clean].Value)) end
+                New("UIGradient", { Parent = sq, Transparency = NumberSequence.new(clean) })
             end
             alphaFill = New("Frame", { Parent = alphaBar, Size = UDim2.fromScale(1, 1), BorderSizePixel = 0, ZIndex = 2 })
             w:_corner(alphaFill, "pill")
@@ -3810,8 +3929,7 @@ local Prism = (function()
 
         -- dragging (mouse + touch); the page stops scrolling while you drag
         local function apply(kind, pos)
-            -- input positions exclude the top bar inset, AbsolutePosition here includes it
-            pos = Vector2.new(pos.X, pos.Y + GuiService:GetGuiInset().Y)
+            -- pos is already in screen space (screenPos / _capture)
             if kind == "sv" then
                 local ap, as = sv.AbsolutePosition, sv.AbsoluteSize
                 s = math.clamp((pos.X - ap.X) / math.max(as.X, 1), 0, 1)
@@ -3831,7 +3949,7 @@ local Prism = (function()
                 tab.Page.ScrollingEnabled = false
                 local base = kind == "sv" and (touch and 18 or 14) or (barH + 6)
                 tween(cursor, { Size = UDim2.fromOffset(base + 4, base + 4) }, TweenInfo.new(0.08))
-                apply(kind, i.Position)
+                apply(kind, screenPos(i))
                 w:_capture(i, function(p) apply(kind, p) end, function()
                     tween(cursor, { Size = UDim2.fromOffset(base, base) }, TI_POP)
                     tab.Page.ScrollingEnabled = true
@@ -4383,7 +4501,8 @@ local Prism = (function()
         local obj = { values = cfg.Values or {} }
         local function redraw()
             local vals = obj.values
-            local W, H = plot.AbsoluteSize.X, plot.AbsoluteSize.Y
+            local sc = w:_uiScale()
+            local W, H = plot.AbsoluteSize.X / sc, plot.AbsoluteSize.Y / sc
             if W < 20 or H < 20 or #vals < 2 then return end
             local min, max = math.min(table.unpack(vals)), math.max(table.unpack(vals))
             if max == min then max = min + 1 end
@@ -4395,7 +4514,14 @@ local Prism = (function()
             end
             drawLine(w, plot, points, cfg.Thickness or 2, cfg.Fill ~= false, cfg.Dots ~= false)
         end
-        plot:GetPropertyChangedSignal("AbsoluteSize"):Connect(redraw)
+        local lastSize
+        plot:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            -- open/close and minimize animations scale the window every frame; only redraw when the
+            -- plot's own size changed, not its on-screen scale
+            local sz = plot.AbsoluteSize / w:_uiScale()
+            sz = Vector2.new(math.floor(sz.X + 0.5), math.floor(sz.Y + 0.5))
+            if sz ~= lastSize then lastSize = sz; redraw() end
+        end)
         task.defer(redraw)
         function obj:Set(values) obj.values = values; redraw() end
         function obj:Get() return obj.values end
@@ -4425,7 +4551,8 @@ local Prism = (function()
         local obj = { values = cfg.Values or {} }
         local function redrawSpark()
             local vals = obj.values
-            local W, H = spark.AbsoluteSize.X, spark.AbsoluteSize.Y
+            local sc = w:_uiScale()
+            local W, H = spark.AbsoluteSize.X / sc, spark.AbsoluteSize.Y / sc
             if W < 10 or H < 10 or #vals < 2 then return end
             local min, max = math.min(table.unpack(vals)), math.max(table.unpack(vals))
             if max == min then max = min + 1 end
@@ -4435,7 +4562,12 @@ local Prism = (function()
             end
             drawLine(w, spark, points, 2, false, false)
         end
-        spark:GetPropertyChangedSignal("AbsoluteSize"):Connect(redrawSpark)
+        local lastSpark
+        spark:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            local sz = spark.AbsoluteSize / w:_uiScale()
+            sz = Vector2.new(math.floor(sz.X + 0.5), math.floor(sz.Y + 0.5))
+            if sz ~= lastSpark then lastSpark = sz; redrawSpark() end
+        end)
         local function paintTrend(delta)
             local num = tonumber(delta)
             if num == nil then trend.Text = tostring(delta or ""); trend.TextColor3 = w.Theme.SubText; return end
@@ -4851,6 +4983,7 @@ local Prism = (function()
     end
 
     function Window:_collectState()
+        self:_buildAllLazy() -- otherwise saving before opening Appearance would drop its settings
         local widgets, enumTypes = {}, {}
         for key, widget in pairs(self._stateWidgets) do
             local ok, value = pcall(widget.Get, widget)
@@ -4902,6 +5035,7 @@ local Prism = (function()
     end
 
     function Window:_applyState(s)
+        self:_buildAllLazy()
         if type(s) ~= "table" then error("invalid config data") end
         local decodedSettings = {}
         if type(s.widgets) == "table" then
@@ -5181,25 +5315,47 @@ local Prism = (function()
 
         -- soft 9-slice images for the glow and the drop shadow: one image each, smooth falloff,
         -- no visible banding (the old stacked frames showed hard rings)
-        -- accent glow: a few rounded outlines stacked outside the window edge. Each is faint, they
-        -- overlap most right at the edge, so the colour fades out smoothly and always matches the corners.
-        local glow = New("Frame", { Name = "Glow", Parent = holder, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = -1, Visible = self._glow })
+        -- edge pulse (replaces the old glow): thin accent rings ripple out from the window's edge and
+        -- fade, a few seconds apart. Pure engine tweens (paused while the window is hidden), and each
+        -- ring is one rounded outline, so it always matches the window's corners.
+        local glow = New("Frame", { Name = "Pulse", Parent = holder, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = -1, Visible = self._glow })
         local glowRings = {}
-        for i = 1, 6 do
-            local ring = New("Frame", { Parent = glow, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = -1 })
+        local PERIOD, RINGS, GROW = 3.6, 3, 34
+        for i = 1, RINGS do
+            local ring = New("Frame", { Parent = glow, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = -1 })
             local c = New("UICorner", { Parent = ring })
-            local st = New("UIStroke", { Parent = ring, Thickness = i * 2.5, Transparency = 0.86 + i * 0.015, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, LineJoinMode = Enum.LineJoinMode.Round })
-            table.insert(glowRings, { corner = c, stroke = st })
+            local st = New("UIStroke", { Parent = ring, Thickness = 1.5, Transparency = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
+            table.insert(glowRings, { ring = ring, corner = c, stroke = st, delay = (i - 1) * PERIOD / RINGS })
         end
-        self:_onTheme(glow, function()
-            local r = self._minimized and UDim.new(1, 0) or UDim.new(0, self.CornerRadius)
+        local function startPulse()
             for _, g in ipairs(glowRings) do
-                g.stroke.Color = self.Theme.Accent
-                g.corner.CornerRadius = r
+                if g.tweens then for _, tw in ipairs(g.tweens) do tw:Cancel() end end
+                local r = self.CornerRadius
+                g.ring.Size = UDim2.fromScale(1, 1)
+                g.corner.CornerRadius = UDim.new(0, r)
+                g.stroke.Transparency = 0.25
+                local info = TweenInfo.new(PERIOD, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, -1, false, 0)
+                g.tweens = {
+                    TweenService:Create(g.ring, info, { Size = UDim2.new(1, GROW, 1, GROW) }),
+                    TweenService:Create(g.corner, info, { CornerRadius = UDim.new(0, r + GROW / 2) }),
+                    TweenService:Create(g.stroke, info, { Transparency = 1 }),
+                }
+                g.stroke.Transparency = 1
+                for _, tw in ipairs(g.tweens) do table.insert(self._loops, tw) end
+                task.delay(g.delay, function()
+                    if not g.ring.Parent then return end
+                    g.stroke.Transparency = 0.25
+                    if self._loopsRunning ~= false and ANIM.speed > 0 then for _, tw in ipairs(g.tweens) do tw:Play() end end
+                end)
             end
+        end
+        self._startPulse = startPulse
+        self:_onTheme(glow, function()
+            for _, g in ipairs(glowRings) do g.stroke.Color = self.Theme.Accent end
         end)
+        startPulse()
         self._glowImage = glow
-        self._glowRings = glowRings
+        self._glowRings = {}
 
         local shadow = New("ImageLabel", {
             Name = "Shadow", Parent = holder, BackgroundTransparency = 1, Image = SHADOW_IMAGE,
@@ -5524,12 +5680,26 @@ local Prism = (function()
         searchStroke.Transparency = 1
         searchBox.Focused:Connect(function() tween(searchStroke, { Transparency = 0.3 }) end)
         searchBox.FocusLost:Connect(function() tween(searchStroke, { Transparency = 1 }) end)
-        searchBox:GetPropertyChangedSignal("Text"):Connect(function() self:_applySearch(searchBox.Text) end)
+        -- debounced: filtering runs once typing pauses (0.12s), not on every keystroke
+        local searchSerial = 0
+        searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+            searchSerial += 1
+            local my = searchSerial
+            if searchBox.Text == "" then self:_applySearch("") return end
+            task.delay(0.12, function() if my == searchSerial then self:_applySearch(searchBox.Text) end end)
+        end)
         self._searchBox = searchBox
 
         local tabList = New("ScrollingFrame", { Parent = sidebar, BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.new(), ScrollBarThickness = 0 })
         self._tabPad = New("UIPadding", { Parent = tabList })
         self._tabLayout = New("UIListLayout", { Parent = tabList, Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder })
+        -- keep the shared tab highlight on the active button when the list scrolls, re-lays out
+        -- (search, new tabs) or resizes. Positions are relative to the list, so dragging the window
+        -- doesn't fire any of these.
+        local function follow() self:_moveHighlight(false) end
+        tabList:GetPropertyChangedSignal("CanvasPosition"):Connect(follow)
+        self._tabLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(follow)
+        tabList:GetPropertyChangedSignal("Size"):Connect(follow)
         self._tabList = tabList
         -- one highlight that glides between tabs (sits under the transparent tab list)
         local hlClip = New("Frame", { Name = "HighlightClip", Parent = sidebar, BackgroundTransparency = 1, ClipsDescendants = true, ZIndex = 0 })
@@ -5598,15 +5768,21 @@ local Prism = (function()
                     table.insert(parts, New("Frame", { Parent = host, Position = UDim2.fromOffset(0, y), Size = UDim2.new(1, 0, 0, 1), BorderSizePixel = 0, BackgroundTransparency = 0.8 }))
                 end
             else
-                for x = step, maxW, step do
-                    for y = step, maxH, step do
-                        table.insert(parts, New("Frame", { Parent = host, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(2, 2), BorderSizePixel = 0, BackgroundTransparency = 0.6 }))
-                    end
+                -- dots: each row is one monospace label of "•" and spaces, so a 700x500 area is ~20
+                -- labels instead of ~600 frames. Code font glyphs are 0.5em wide: 4 chars at size 12 = 24px.
+                local cols = math.ceil(maxW / step) + 1
+                local row = string.rep("•   ", cols)
+                for y = step, maxH, step do
+                    table.insert(parts, New("TextLabel", { Parent = host, AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromOffset(step - 3, y),
+                        Size = UDim2.new(0, cols * step, 0, 12), BackgroundTransparency = 1, Text = row, Font = Enum.Font.Code, TextSize = 12,
+                        TextXAlignment = Enum.TextXAlignment.Left, TextTransparency = 0.45 }))
                 end
             end
             self:_onTheme(host, function()
                 local c = self.Theme.Stroke
-                for _, p in ipairs(parts) do p.BackgroundColor3 = c end
+                for _, p in ipairs(parts) do
+                    if p:IsA("TextLabel") then p.TextColor3 = c else p.BackgroundColor3 = c end
+                end
             end)
             return host
         end
@@ -5626,7 +5802,7 @@ local Prism = (function()
                 if not isPress(i) or self._minimized then return end
                 -- the window is anchored at its centre, so move it by half the growth to keep the
                 -- top-left corner still and the bottom-right corner under the pointer
-                local start, startSize, startPos = i.Position, self._size, holder.Position
+                local start, startSize, startPos = screenPos(i), self._size, holder.Position
                 self:_capture(i, function(p)
                     local sc = self._userScale
                     local nw = math.max(360, startSize.X + (p.X - start.X) / sc)
@@ -5647,7 +5823,7 @@ local Prism = (function()
         end
         dragSurface.InputBegan:Connect(function(i)
             if not isPress(i) then return end
-            local start = Vector2.new(i.Position.X, i.Position.Y)
+            local start = screenPos(i)
             if inRect(self._controlGroup, start) then return end
             local startPos, moved = holder.Position, false
             self:_capture(i, function(p)
@@ -5692,7 +5868,7 @@ local Prism = (function()
             self:_tooltip(fab, "Open / close")
             fab.InputBegan:Connect(function(i)
                 if not isPress(i) then return end
-                local fabStart, fabPos, moved = i.Position, fab.Position, false
+                local fabStart, fabPos, moved = screenPos(i), fab.Position, false
                 self:_capture(i, function(p)
                     local dx, dy = p.X - fabStart.X, p.Y - fabStart.Y
                     if math.abs(dx) + math.abs(dy) > 8 then moved = true end
