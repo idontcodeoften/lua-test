@@ -33,6 +33,15 @@
     })
 
     What's new in v1.9
+      * Dropdown fix (3): clicks went through an open menu to the buttons behind it (its background
+        and the gaps between options didn't block input). The menu now blocks clicks over its whole
+        area, and an invisible backdrop behind it catches any other click and just closes the menu,
+        like a website. Closing no longer uses screen coordinates at all.
+      * Dropdown fix (2): the last options still couldn't be picked on some setups. The "pressed
+        inside the menu" signal from the options was being wiped by the global click handler when
+        Roblox fired them in the other order; presses are now time-stamped so order doesn't matter.
+        Prism also learns which coordinate space the pointer is reported in from real presses on
+        tabs, cards and dropdowns, so the colour picker, ripples and menus line up on every client.
       * Dropdown fix: options sometimes couldn't be picked because the "clicked outside the menu"
         check measured the click in a different coordinate space from the menu, closing it under
         your cursor. It now uses true screen positions and also waits a frame for the menu's own
@@ -368,14 +377,36 @@ local Prism = (function()
 
     local function isPress(i) return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch end
     local function isMove(i)  return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch end
-    -- Pointer position in the same space as this gui's AbsolutePosition (IgnoreGuiInset = true).
-    -- Mouse: GetMouseLocation is true screen space. Touch: add the top bar inset.
+    -- Pointer position in the same space as this gui's AbsolutePosition.
+    -- Which space Roblox reports positions in (with or without the top bar inset) differs between
+    -- clients and executors, so the offset is learned from real presses: when a known button is
+    -- pressed, calibrate() checks which offset puts the pointer inside it and remembers it.
+    local POS_FIX = { mouse = Vector2.zero, touch = nil }
+    local function isMouseType(t)
+        return t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.MouseButton2
+    end
+    local function rawPos(i)
+        if isMouseType(i.UserInputType) then return UserInputService:GetMouseLocation() end
+        return Vector2.new(i.Position.X, i.Position.Y)
+    end
     local function screenPos(i)
-        local t = i.UserInputType
-        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.MouseButton2 then
-            return UserInputService:GetMouseLocation()
+        if isMouseType(i.UserInputType) then return rawPos(i) + POS_FIX.mouse end
+        return rawPos(i) + (POS_FIX.touch or Vector2.new(0, GuiService:GetGuiInset().Y))
+    end
+    -- g was just pressed by input i, so the pointer must be inside g.
+    local function calibrate(g, i)
+        if not (g and i) or g.AbsoluteSize.X <= 0 then return end
+        local key = isMouseType(i.UserInputType) and "mouse" or (i.UserInputType == Enum.UserInputType.Touch and "touch" or nil)
+        if not key then return end
+        local ap, as = g.AbsolutePosition, g.AbsoluteSize
+        local function inside(p) return p.X >= ap.X - 1 and p.X <= ap.X + as.X + 1 and p.Y >= ap.Y - 1 and p.Y <= ap.Y + as.Y + 1 end
+        local raw = rawPos(i)
+        local current = POS_FIX[key] or Vector2.new(0, GuiService:GetGuiInset().Y)
+        if inside(raw + current) then POS_FIX[key] = current return end
+        local inset = GuiService:GetGuiInset()
+        for _, c in ipairs({ Vector2.zero, Vector2.new(0, inset.Y), Vector2.new(0, -inset.Y), inset, -inset }) do
+            if inside(raw + c) then POS_FIX[key] = c return end
         end
-        return Vector2.new(i.Position.X, i.Position.Y + GuiService:GetGuiInset().Y)
     end
 
     local function pad(parent, t, r, b, l)
@@ -802,6 +833,17 @@ local Prism = (function()
     function Window:_popupLayer()
         if not self._popups then
             self._popups = New("Frame", { Name = "Popups", Parent = self.Holder, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 60 })
+            -- Invisible backdrop under an open menu, like a website's click-catcher: it swallows the
+            -- click so nothing behind the menu gets pressed, and closes the menu. Extends well past
+            -- the window so clicks just outside it are caught too.
+            local backdrop = New("TextButton", {
+                Name = "Backdrop", Parent = self._popups, BackgroundTransparency = 1, Text = "", AutoButtonColor = false,
+                Position = UDim2.fromScale(-1.5, -1.5), Size = UDim2.fromScale(4, 4), ZIndex = 59, Visible = false,
+            })
+            backdrop.InputBegan:Connect(function(i)
+                if isPress(i) then self:_markPopupHit(); self:_closePopup() end
+            end)
+            self._backdrop = backdrop
         end
         return self._popups
     end
@@ -809,29 +851,23 @@ local Prism = (function()
     function Window:_openPopup(p)
         if self._popup and self._popup.frame ~= p.frame then self:_closePopup() end
         self._popup = p
+        if self._backdrop then self._backdrop.Visible = true end
         if not self._popupWatch then
             self._popupWatch = true
+            -- Catches presses the backdrop can't see (e.g. on other GUIs or the game view far from
+            -- the window). Every part of a menu stamps the time when pressed; Roblox may run those
+            -- events before or after this one, so we wait a frame and compare times. No screen
+            -- coordinates are used, so this works the same on every client.
             self:_connect(UserInputService.InputBegan, function(i)
                 local cur = self._popup
                 if not cur or not isPress(i) then return end
-                -- Two independent checks must both say "outside" before the menu closes:
-                -- 1) geometry. Mouse uses GetMouseLocation (true screen space, same as this gui's
-                --    AbsolutePosition); touch adds the top bar inset to its position.
-                local pt = screenPos(i)
-                local function inside(g)
-                    if not g or not g.Parent then return false end
-                    local ap, as = g.AbsolutePosition, g.AbsoluteSize
-                    return pt.X >= ap.X - 2 and pt.X <= ap.X + as.X + 2 and pt.Y >= ap.Y - 2 and pt.Y <= ap.Y + as.Y + 2
-                end
-                if inside(cur.frame) or inside(cur.anchor) then return end
-                -- 2) the menu's own controls. Any press on the menu, its options, its search box or
-                --    the dropdown box marks a hit; wait a frame for those events, then decide.
-                self._popupHit = false
+                local t0 = os.clock()
                 self._popupPress = (self._popupPress or 0) + 1
                 local my = self._popupPress
                 task.spawn(function()
                     RunService.Heartbeat:Wait()
-                    if my == self._popupPress and not self._popupHit and self._popup == cur then
+                    local hitAt = self._popupHitAt or -1
+                    if my == self._popupPress and hitAt < t0 - 0.05 and self._popup == cur then
                         self:_closePopup()
                     end
                 end)
@@ -839,9 +875,10 @@ local Prism = (function()
         end
     end
 
-    function Window:_markPopupHit() self._popupHit = true end
+    function Window:_markPopupHit() self._popupHitAt = os.clock() end
 
     function Window:_closePopup()
+        if self._backdrop then self._backdrop.Visible = false end
         local p = self._popup
         if not p then return end
         self._popup = nil
@@ -2636,6 +2673,7 @@ local Prism = (function()
             tween(label, { TextColor3 = self.Theme.SubText }, MOTION.Fast)
         end)
 
+        btn.InputBegan:Connect(function(i) if isPress(i) then calibrate(btn, i) end end)
         btn.MouseButton1Click:Connect(function() self:SelectTab(tab) end)
 
         local page = New("ScrollingFrame", {
@@ -2961,6 +2999,7 @@ local Prism = (function()
         end)
         card.InputBegan:Connect(function(input)
             if isPress(input) then
+                calibrate(card, input)
                 if row then
                     tween(card, { BackgroundTransparency = 0.2 }, TweenInfo.new(0.07))
                 else
@@ -3358,7 +3397,7 @@ local Prism = (function()
         w:_bind(arrow, "TextColor3", "SubText")
 
         -- popover: floats above the page (on the window's popup layer) instead of growing the card
-        local pop = New("Frame", { Name = "DropdownMenu", Parent = w:_popupLayer(), Visible = false, BorderSizePixel = 0, ClipsDescendants = true, ZIndex = 60 })
+        local pop = New("TextButton", { Name = "DropdownMenu", Parent = w:_popupLayer(), Visible = false, BorderSizePixel = 0, ClipsDescendants = true, ZIndex = 60, Text = "", AutoButtonColor = false, Active = true })
         w:_corner(pop, 0.7)
         w:_bind(pop, "BackgroundColor3", "Surface")
         w:_edge(pop, { flat = { key = "Stroke", t = 0.3 } })
@@ -3380,7 +3419,7 @@ local Prism = (function()
         w:_bind(searchBox, "BackgroundColor3", "Elevated"); w:_bind(searchBox, "TextColor3", "Text"); w:_bind(searchBox, "PlaceholderColor3", "SubText")
         w:_focusRing(searchBox)
 
-        local list = New("ScrollingFrame", { Parent = pop, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 0), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3, LayoutOrder = 2, ZIndex = 61 })
+        local list = New("ScrollingFrame", { Parent = pop, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 0), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3, LayoutOrder = 2, ZIndex = 61, Active = true })
         w:_bind(list, "ScrollBarImageColor3", "Stroke")
         New("UIListLayout", { Parent = list, Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder })
         list.InputBegan:Connect(function(i) if isPress(i) then w:_markPopupHit() end end)
@@ -3465,7 +3504,10 @@ local Prism = (function()
                 end)
             else
                 if scrollConn then scrollConn:Disconnect(); scrollConn = nil end
-                if w._popup and w._popup.frame == pop then w._popup = nil end
+                if w._popup and w._popup.frame == pop then
+                    w._popup = nil
+                    if w._backdrop then w._backdrop.Visible = false end
+                end
                 if searchBox.Text ~= "" then searchBox.Text = "" end
                 tween(pop, { Size = UDim2.fromOffset(pop.Size.X.Offset, 0) }, MOTION.Fast)
                 tween(popScale, { Scale = 0.97 }, MOTION.Fast)
@@ -3516,7 +3558,7 @@ local Prism = (function()
                 end)
                 b.MouseLeave:Connect(function() paint() end)
                 b.MouseButton1Down:Connect(function() w:_markPopupHit() end)
-                b.InputBegan:Connect(function(i) if isPress(i) then w:_markPopupHit() end end)
+                b.InputBegan:Connect(function(i) if isPress(i) then calibrate(b, i); w:_markPopupHit() end end)
                 b.MouseButton1Click:Connect(function() choose(val) end)
             end
             resizePop()
@@ -3550,6 +3592,7 @@ local Prism = (function()
             display(); repaint(); safe(cfg.Callback, obj:Get())
         end
         box.MouseButton1Down:Connect(function() w:_markPopupHit() end)
+        box.InputBegan:Connect(function(i) if isPress(i) then calibrate(box, i); w:_markPopupHit() end end)
         box.MouseButton1Click:Connect(function() setOpen(not isOpen) end)
         rebuild()
         return self:_registerState(cfg, obj)
@@ -3949,6 +3992,7 @@ local Prism = (function()
                 tab.Page.ScrollingEnabled = false
                 local base = kind == "sv" and (touch and 18 or 14) or (barH + 6)
                 tween(cursor, { Size = UDim2.fromOffset(base + 4, base + 4) }, TweenInfo.new(0.08))
+                calibrate(target, i)
                 apply(kind, screenPos(i))
                 w:_capture(i, function(p) apply(kind, p) end, function()
                     tween(cursor, { Size = UDim2.fromOffset(base, base) }, TI_POP)
